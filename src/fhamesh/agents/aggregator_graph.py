@@ -25,6 +25,7 @@ fallback.
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
 from typing import Annotated, Any, TypedDict
 
 from pydantic import BaseModel, Field
@@ -96,6 +97,7 @@ class SynthesisGraph:
     """Compiled LangGraph pipeline: merge -> reason <-> tools -> synthesize -> verify."""
 
     def __init__(self, llm: Any, merger: ResultAggregator | None = None):
+        self._raw_llm = llm
         self._tools = build_synthesis_tools()
         self._tool_llm = llm.bind_tools(self._tools)
         self._synthesis_llm = llm.with_structured_output(ResultSynthesis)
@@ -179,6 +181,30 @@ class SynthesisGraph:
         merged.summary = state.get("summary", "")
         return merged
 
+    async def astream(self, results: list[QueryResult]) -> AsyncIterator[str]:
+        """Stream a live text preview of the summary as it's generated.
+
+        This is a separate, simpler pass than run(): no tool loop, no
+        verification — just the raw model streaming tokens for a fast
+        first-byte UX while the user waits. run() is still what
+        produces the authoritative, verified QueryResult.summary;
+        callers that stream should still call run() afterward (or in
+        parallel) and treat these chunks as a preview, not the final
+        answer. Yields nothing if there's no data to summarize.
+        """
+        merged = await self._merger.aggregate(results)
+        if not merged.success or not merged.data:
+            return
+
+        human = f"Result data (already privacy-protected): {merged.data}"
+        if merged.noise_applied:
+            human += "\nDifferential privacy noise has been applied to numeric values."
+
+        async for chunk in self._raw_llm.astream([("system", _SYSTEM_PROMPT), ("human", human)]):
+            content = getattr(chunk, "content", "")
+            if content:
+                yield content
+
 
 class LangGraphAggregator(BaseAggregator):
     """BaseAggregator backed by a LangGraph synthesis agent, with a merge-only fallback.
@@ -214,3 +240,23 @@ class LangGraphAggregator(BaseAggregator):
                 logger.warning("LangGraph synthesis unavailable, falling back to merge-only", exc_info=True)
 
         return await self._fallback.aggregate(results)
+
+    @property
+    def can_stream(self) -> bool:
+        """True if there's a live model to stream a preview from."""
+        return self._graph is not None
+
+    async def astream_summary(self, results: list[QueryResult]) -> AsyncIterator[str]:
+        """Stream a live text preview. Yields nothing if can_stream is False.
+
+        Callers must still call aggregate() for the authoritative,
+        verified QueryResult.summary — this is a preview, not a
+        replacement.
+        """
+        if self._graph is None:
+            return
+        try:
+            async for chunk in self._graph.astream(results):
+                yield chunk
+        except Exception:
+            logger.warning("Streaming synthesis preview failed, no chunks sent", exc_info=True)

@@ -210,3 +210,67 @@ class TestLangGraphAggregator:
         merged = await aggregator.aggregate([QueryResult(success=True, data={"count": 42})])
 
         assert merged.summary == "There are 42 products in stock."
+
+
+class _FakeChunk:
+    def __init__(self, content):
+        self.content = content
+
+
+class _FakeStreamingLLM:
+    """Supports astream() for the preview path; with_structured_output()
+    would raise if the streaming path accidentally tried to use it."""
+
+    def __init__(self, words):
+        self._words = words
+
+    async def astream(self, messages):
+        for word in self._words:
+            yield _FakeChunk(word)
+
+    def bind_tools(self, tools):
+        return _FakeToolLLM()
+
+    def with_structured_output(self, schema):
+        return _FakeStructuredLLM(error=AssertionError("structured output should not run during astream"))
+
+
+class TestSynthesisStreaming:
+    async def test_astream_yields_text_chunks(self):
+        graph = SynthesisGraph(_FakeStreamingLLM(["Average", " salary", " is", " $142,300."]))
+
+        chunks = [c async for c in graph.astream([QueryResult(success=True, data={"avg_salary": 142300.0})])]
+
+        assert "".join(chunks) == "Average salary is $142,300."
+
+    async def test_astream_yields_nothing_for_failed_result(self):
+        graph = SynthesisGraph(_FakeStreamingLLM(["should", " not", " appear"]))
+
+        chunks = [c async for c in graph.astream([QueryResult(success=False, error_message="denied")])]
+
+        assert chunks == []
+
+    async def test_aggregator_can_stream_reflects_graph_availability(self):
+        streaming = LangGraphAggregator(fallback=ResultAggregator())
+        streaming._graph = SynthesisGraph(_FakeStreamingLLM(["ok"]))
+        assert streaming.can_stream is True
+
+        no_model = LangGraphAggregator({"ollama": {"base_url": "http://127.0.0.1:1"}})
+        no_model._graph = None
+        assert no_model.can_stream is False
+
+    async def test_aggregator_astream_summary_delegates_to_graph(self):
+        aggregator = LangGraphAggregator(fallback=ResultAggregator())
+        aggregator._graph = SynthesisGraph(_FakeStreamingLLM(["Average", " is", " 42."]))
+
+        chunks = [c async for c in aggregator.astream_summary([QueryResult(success=True, data={"x": 42})])]
+
+        assert "".join(chunks) == "Average is 42."
+
+    async def test_astream_summary_yields_nothing_without_a_graph(self):
+        aggregator = LangGraphAggregator(fallback=ResultAggregator())
+        aggregator._graph = None
+
+        chunks = [c async for c in aggregator.astream_summary([QueryResult(success=True, data={"x": 1})])]
+
+        assert chunks == []
