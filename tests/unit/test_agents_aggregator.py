@@ -8,34 +8,56 @@ import pytest
 
 pytest.importorskip("langgraph")
 
-from fhamesh.agents.aggregator_graph import LangGraphAggregator, ResultSynthesis, SynthesisGraph
+from langchain_core.messages import AIMessage
+
+from fhamesh.agents.aggregator_graph import (
+    LangGraphAggregator,
+    ResultSynthesis,
+    SynthesisGraph,
+    VerificationResult,
+)
 from fhamesh.core.message import QueryResult
 from fhamesh.orchestrator.aggregator import ResultAggregator
 
 
 class _FakeStructuredLLM:
-    def __init__(self, synthesis: ResultSynthesis | None = None, error: Exception | None = None):
-        self._synthesis = synthesis
+    def __init__(self, response=None, error: Exception | None = None):
+        self._response = response
         self._error = error
 
     async def ainvoke(self, messages):
         if self._error:
             raise self._error
-        return self._synthesis
+        return self._response
+
+
+class _FakeToolLLM:
+    """Never calls a tool — the reasoning loop goes straight to synthesize."""
+
+    async def ainvoke(self, messages):
+        return AIMessage(content="no tools needed")
 
 
 class _FakeLLM:
-    def __init__(self, structured: _FakeStructuredLLM):
-        self._structured = structured
+    """bind_tools() always skips straight to synthesis; with_structured_output()
+    returns the synthesis fake or the verify fake depending on which schema
+    is requested, mirroring how SynthesisGraph actually calls both."""
+
+    def __init__(self, synthesis=None, synth_error=None, verify=None):
+        self._synthesis = _FakeStructuredLLM(synthesis, error=synth_error)
+        self._verify = _FakeStructuredLLM(verify or VerificationResult(consistent=True))
+
+    def bind_tools(self, tools):
+        return _FakeToolLLM()
 
     def with_structured_output(self, schema):
-        return self._structured
+        return self._synthesis if schema is ResultSynthesis else self._verify
 
 
 class TestSynthesisGraph:
     async def test_merge_then_synthesize(self):
         synthesis = ResultSynthesis(summary="Average salary is $142,300.")
-        graph = SynthesisGraph(_FakeLLM(_FakeStructuredLLM(synthesis)))
+        graph = SynthesisGraph(_FakeLLM(synthesis))
 
         merged = await graph.run([QueryResult(success=True, data={"avg_salary": 142300.0}, noise_applied=True)])
 
@@ -46,8 +68,7 @@ class TestSynthesisGraph:
 
     async def test_merge_preserves_existing_aggregation_semantics(self):
         """The merge step is unchanged: budget sums, redactions union, success is AND."""
-        synthesis = ResultSynthesis(summary="")
-        graph = SynthesisGraph(_FakeLLM(_FakeStructuredLLM(synthesis)))
+        graph = SynthesisGraph(_FakeLLM(ResultSynthesis(summary="")))
 
         results = [
             QueryResult(success=True, data={"a": 1}, privacy_budget_consumed=0.5, fields_redacted=["ssn"]),
@@ -59,7 +80,103 @@ class TestSynthesisGraph:
         assert set(merged.fields_redacted) == {"ssn", "email"}
 
     async def test_no_summary_for_failed_or_empty_results(self):
-        graph = SynthesisGraph(_FakeLLM(_FakeStructuredLLM(ResultSynthesis(summary="should not be called"))))
+        graph = SynthesisGraph(_FakeLLM(ResultSynthesis(summary="should not be called")))
+
+        merged = await graph.run([QueryResult(success=False, error_message="denied")])
+
+        assert merged.summary == ""
+
+
+class _ScriptedToolLLM:
+    def __init__(self, script: list[dict | None]):
+        self._script = script
+        self.calls = 0
+
+    async def ainvoke(self, messages):
+        tool_call = self._script[self.calls] if self.calls < len(self._script) else None
+        self.calls += 1
+        if tool_call:
+            return AIMessage(content="", tool_calls=[tool_call])
+        return AIMessage(content="done reasoning")
+
+
+class _ScriptedLLM:
+    def __init__(self, tool_script: list[dict | None], synthesis: ResultSynthesis):
+        self._tool_llm = _ScriptedToolLLM(tool_script)
+        self._synthesis = synthesis
+
+    def bind_tools(self, tools):
+        return self._tool_llm
+
+    def with_structured_output(self, schema):
+        if schema is ResultSynthesis:
+            return _FakeStructuredLLM(self._synthesis)
+        return _FakeStructuredLLM(VerificationResult(consistent=True))
+
+
+class TestSynthesisToolLoop:
+    async def test_real_tool_call_computes_a_real_percentage(self):
+        """compute_percentage_change actually runs — not mocked away."""
+        tool_script = [
+            {"name": "compute_percentage_change", "args": {"old_value": 100, "new_value": 150}, "id": "call_1"},
+            None,
+        ]
+        synthesis = ResultSynthesis(summary="Revenue grew 50%.")
+        graph = SynthesisGraph(_ScriptedLLM(tool_script, synthesis))
+
+        merged = await graph.run([QueryResult(success=True, data={"old": 100, "new": 150})])
+
+        assert merged.summary == "Revenue grew 50%."
+
+    async def test_runaway_tool_loop_is_capped(self):
+        always_call = {"name": "format_currency", "args": {"amount": 100.0}, "id": "call_x"}
+        llm = _ScriptedLLM([always_call] * 20, ResultSynthesis(summary="ok"))
+        graph = SynthesisGraph(llm)
+
+        merged = await graph.run([QueryResult(success=True, data={"x": 1})])
+
+        assert merged.summary == "ok"
+        assert llm._tool_llm.calls <= 4
+
+
+class TestVerification:
+    async def test_consistent_summary_passes_through_unchanged(self):
+        synthesis = ResultSynthesis(summary="Average salary is $142,300.")
+        verify = VerificationResult(consistent=True)
+        graph = SynthesisGraph(_FakeLLM(synthesis, verify=verify))
+
+        merged = await graph.run([QueryResult(success=True, data={"avg_salary": 142300.0})])
+
+        assert merged.summary == "Average salary is $142,300."
+
+    async def test_inconsistent_summary_gets_corrected(self):
+        synthesis = ResultSynthesis(summary="Average salary is $999,000.")  # hallucinated
+        verify = VerificationResult(
+            consistent=False,
+            corrected_summary="Average salary is $142,300.",
+            issues=["Summary stated $999,000 but data shows $142,300"],
+        )
+        graph = SynthesisGraph(_FakeLLM(synthesis, verify=verify))
+
+        merged = await graph.run([QueryResult(success=True, data={"avg_salary": 142300.0})])
+
+        assert merged.summary == "Average salary is $142,300."
+
+    async def test_inconsistent_summary_with_no_correction_is_dropped(self):
+        synthesis = ResultSynthesis(summary="Something made up.")
+        verify = VerificationResult(consistent=False, corrected_summary="", issues=["Not grounded in data"])
+        graph = SynthesisGraph(_FakeLLM(synthesis, verify=verify))
+
+        merged = await graph.run([QueryResult(success=True, data={"x": 1})])
+
+        assert merged.summary == ""  # safer to show nothing than a known-bad summary
+
+    async def test_verification_is_skipped_when_there_is_no_summary(self):
+        """No summary (failed/empty result) means verify should never even call the model."""
+        verify_llm = _FakeStructuredLLM(error=AssertionError("verify should not have been called"))
+        llm = _FakeLLM(ResultSynthesis(summary=""))
+        llm._verify = verify_llm
+        graph = SynthesisGraph(llm)
 
         merged = await graph.run([QueryResult(success=False, error_message="denied")])
 
@@ -78,7 +195,7 @@ class TestLangGraphAggregator:
 
     async def test_falls_back_on_model_error(self):
         aggregator = LangGraphAggregator(fallback=ResultAggregator())
-        aggregator._graph = SynthesisGraph(_FakeLLM(_FakeStructuredLLM(error=RuntimeError("boom"))))
+        aggregator._graph = SynthesisGraph(_FakeLLM(synth_error=RuntimeError("boom")))
 
         merged = await aggregator.aggregate([QueryResult(success=True, data={"x": 1})])
 
@@ -88,7 +205,7 @@ class TestLangGraphAggregator:
     async def test_happy_path_uses_the_graph(self):
         synthesis = ResultSynthesis(summary="There are 42 products in stock.")
         aggregator = LangGraphAggregator(fallback=ResultAggregator())
-        aggregator._graph = SynthesisGraph(_FakeLLM(_FakeStructuredLLM(synthesis)))
+        aggregator._graph = SynthesisGraph(_FakeLLM(synthesis))
 
         merged = await aggregator.aggregate([QueryResult(success=True, data={"count": 42})])
 

@@ -13,7 +13,7 @@ pytest.importorskip("langgraph")
 
 from langchain_core.messages import AIMessage
 
-from fhamesh.agents.aggregator_graph import ResultSynthesis, SynthesisGraph
+from fhamesh.agents.aggregator_graph import ResultSynthesis, SynthesisGraph, VerificationResult
 from fhamesh.agents.classifier_graph import ClassificationGraph, IntentExtraction
 from fhamesh.agents.decomposer_graph import DecompositionPlan, PlanningGraph, SubQueryPlan
 from fhamesh.core.message import QueryResult
@@ -28,13 +28,16 @@ class _FakeStructuredLLM:
 
 
 class _FakeToolLLM:
-    """Never calls a tool — the planner's reasoning loop goes straight to finalize."""
+    """Never calls a tool — the reasoning loop goes straight to the structured step."""
 
     async def ainvoke(self, messages):
         return AIMessage(content="no tools needed")
 
 
 class _FakeLLM:
+    """Used for both the classifier/planner (one structured schema) and the
+    synthesizer (two: ResultSynthesis then VerificationResult)."""
+
     def __init__(self, response):
         self._response = response
 
@@ -42,6 +45,8 @@ class _FakeLLM:
         return _FakeToolLLM()
 
     def with_structured_output(self, schema):
+        if schema is VerificationResult:
+            return _FakeStructuredLLM(VerificationResult(consistent=True))
         return _FakeStructuredLLM(self._response)
 
 
