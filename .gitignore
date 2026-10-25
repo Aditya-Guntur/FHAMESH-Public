@@ -11,6 +11,7 @@ build/
 
 # Virtual environments
 .venv/
+.venv_test/
 venv/
 env/
 
@@ -27,8 +28,16 @@ nul
 
 # Project local (planning stays local, never pushed)
 .claude/
+.serena/
 HANDOFF.md
 CLAUDE.md
+AGENTS.md
+
+# Local scratch, unrelated to the package
+MiniProjectTemplate/
+MiniProjectTemplate.zip
+graft/
+report/
 
 # Data files (generated at runtime)
 *.db
