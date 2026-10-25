@@ -8,6 +8,8 @@ import pytest
 
 pytest.importorskip("langgraph")
 
+from langchain_core.messages import AIMessage
+
 from fhamesh.agents.decomposer_graph import (
     DecompositionPlan,
     LangGraphDecomposer,
@@ -29,9 +31,19 @@ class _FakeStructuredLLM:
         return self._plan
 
 
+class _FakeToolLLM:
+    """Never calls a tool — the reasoning loop goes straight to finalize."""
+
+    async def ainvoke(self, messages):
+        return AIMessage(content="no tools needed")
+
+
 class _FakeLLM:
     def __init__(self, structured: _FakeStructuredLLM):
         self._structured = structured
+
+    def bind_tools(self, tools):
+        return _FakeToolLLM()
 
     def with_structured_output(self, schema):
         return self._structured
@@ -41,6 +53,57 @@ def _intent(**overrides):
     base = {"category": "query", "domain": "hr", "action": "lookup_salary", "confidence": 0.9, "parameters": {}}
     base.update(overrides)
     return IntentDescriptor(**base)
+
+
+class _ScriptedToolLLM:
+    """Calls a tool N times (by script), then stops."""
+
+    def __init__(self, script: list[dict | None]):
+        self._script = script
+        self.calls = 0
+
+    async def ainvoke(self, messages):
+        tool_call = self._script[self.calls] if self.calls < len(self._script) else None
+        self.calls += 1
+        if tool_call:
+            return AIMessage(content="", tool_calls=[tool_call])
+        return AIMessage(content="done reasoning")
+
+
+class _ScriptedLLM:
+    def __init__(self, tool_script: list[dict | None], final_plan: DecompositionPlan):
+        self._tool_llm = _ScriptedToolLLM(tool_script)
+        self._final_plan = final_plan
+
+    def bind_tools(self, tools):
+        return self._tool_llm
+
+    def with_structured_output(self, schema):
+        return _FakeStructuredLLM(self._final_plan)
+
+
+class TestPlanningGraphToolLoop:
+    async def test_real_tool_call_reaches_the_schema_registry(self):
+        """describe_domain actually runs against a real DynamicSchemaRegistry,
+        not a mock — the model just decides to call it."""
+        tool_script = [{"name": "describe_domain", "args": {"domain": "hr"}, "id": "call_1"}, None]
+        final_plan = DecompositionPlan(sub_queries=[SubQueryPlan(table="employees", fields=["salary"], domain="hr")])
+        graph = PlanningGraph(_ScriptedLLM(tool_script, final_plan))
+
+        sub_queries = await graph.run(_intent())
+
+        assert sub_queries[0]["table"] == "employees"
+
+    async def test_runaway_tool_loop_is_capped(self):
+        """A model that always wants to call a tool must still terminate."""
+        always_call = {"name": "list_domains", "args": {}, "id": "call_x"}
+        llm = _ScriptedLLM([always_call] * 20, DecompositionPlan(sub_queries=[]))
+        graph = PlanningGraph(llm)
+
+        sub_queries = await graph.run(_intent())
+
+        assert len(sub_queries) == 1  # still produced a valid (deterministic) plan
+        assert llm._tool_llm.calls <= 5  # didn't loop forever
 
 
 class TestPlanningGraph:

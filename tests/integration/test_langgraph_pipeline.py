@@ -11,6 +11,8 @@ import pytest
 
 pytest.importorskip("langgraph")
 
+from langchain_core.messages import AIMessage
+
 from fhamesh.agents.aggregator_graph import ResultSynthesis, SynthesisGraph
 from fhamesh.agents.classifier_graph import ClassificationGraph, IntentExtraction
 from fhamesh.agents.decomposer_graph import DecompositionPlan, PlanningGraph, SubQueryPlan
@@ -25,9 +27,19 @@ class _FakeStructuredLLM:
         return self._response
 
 
+class _FakeToolLLM:
+    """Never calls a tool — the planner's reasoning loop goes straight to finalize."""
+
+    async def ainvoke(self, messages):
+        return AIMessage(content="no tools needed")
+
+
 class _FakeLLM:
     def __init__(self, response):
         self._response = response
+
+    def bind_tools(self, tools):
+        return _FakeToolLLM()
 
     def with_structured_output(self, schema):
         return _FakeStructuredLLM(self._response)

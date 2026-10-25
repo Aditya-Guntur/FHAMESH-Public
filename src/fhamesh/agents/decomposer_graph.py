@@ -1,13 +1,16 @@
 """LangGraph query-planning agent.
 
-Two nodes:
-- plan: an LLM call that reads the already-classified IntentDescriptor
-  (never raw user text) plus the known domain/table/field schema, and
-  proposes the minimal set of sub-queries needed to answer it
+Four nodes, a real ReAct-style tool loop plus two deterministic safety nets:
+- reason: a tool-bound LLM that can call list_domains / describe_domain
+  to explore the schema (including domains registered at runtime)
+  instead of having it dumped whole into the prompt
+- tools: executes whatever tool call "reason" made, loops back to it
+- finalize: once reasoning is done, one structured-output call turns
+  the conversation into a DecompositionPlan
 - validate_plan: a deterministic safety net — every proposed sub-query
-  is checked against DomainSchema; an unknown table or empty field
-  list is corrected with the same resolution QueryDecomposer uses, so
-  a bad model output can never produce an invalid query
+  is checked against the schema; an unknown table or empty field list
+  is corrected with the same resolution QueryDecomposer uses, so a bad
+  model output can never produce an invalid query
 
 QueryDecomposer (rule-based) is kept as the fallback. The LLM never
 sees any row data here — decomposition happens before DataCore
@@ -17,27 +20,40 @@ executes anything.
 from __future__ import annotations
 
 import logging
-from typing import Any, TypedDict
+from typing import Annotated, Any, TypedDict
 
 from pydantic import BaseModel, Field
 
 from ..core.message import IntentDescriptor
 from ..orchestrator.decomposer import BaseDecomposer, QueryDecomposer
 from ..orchestrator.schema import DomainSchema
+from ..orchestrator.schema_registry import DynamicSchemaRegistry
 from .llm import AGENTS_AVAILABLE, build_ollama_llm
+from .tools import build_schema_tools
 
 logger = logging.getLogger(__name__)
 
 if AGENTS_AVAILABLE:
+    from langchain_core.messages import AIMessage, SystemMessage
     from langgraph.graph import END, START, StateGraph
+    from langgraph.graph.message import add_messages
+    from langgraph.prebuilt import ToolNode, tools_condition
+
+_MAX_TOOL_ROUNDS = 4
 
 _SYSTEM_PROMPT = (
-    "You plan data queries for a system that only knows a fixed schema. "
-    "Propose the minimal set of sub-queries needed to answer the user's "
-    "intent. Use ONLY the tables and fields given to you — never invent "
-    "one. Most intents need exactly one sub-query; only split into more "
+    "You plan data queries for a system with a schema you don't fully know "
+    "yet. Use list_domains and describe_domain to look up what's actually "
+    "available before proposing anything — never guess a table or field "
+    "name. Most intents need exactly one sub-query; only split into more "
     "when the intent genuinely spans multiple domains or asks to compare "
-    "across tables."
+    "across tables. Once you know enough, stop calling tools."
+)
+
+_FINALIZE_PROMPT = (
+    "Based on the conversation above, produce the final structured plan: "
+    "the minimal set of sub-queries needed to answer the user's intent, "
+    "using only tables/fields you actually saw described."
 )
 
 
@@ -56,37 +72,71 @@ class DecompositionPlan(BaseModel):
     sub_queries: list[SubQueryPlan] = Field(default_factory=list)
 
 
-class PlannerState(TypedDict, total=False):
-    intent: IntentDescriptor
-    plan: DecompositionPlan
-    sub_queries: list[dict[str, Any]]
+if AGENTS_AVAILABLE:
+    class PlannerState(TypedDict, total=False):
+        intent: IntentDescriptor
+        messages: Annotated[list[Any], add_messages]
+        tool_rounds: int
+        plan: DecompositionPlan
+        sub_queries: list[dict[str, Any]]
+else:  # pragma: no cover - exercised by the "no [agents] extra" install
+    class PlannerState(TypedDict, total=False):  # type: ignore[no-redef]
+        intent: IntentDescriptor
+        tool_rounds: int
+        plan: Any
+        sub_queries: list[dict[str, Any]]
 
 
 class PlanningGraph:
-    """Compiled LangGraph pipeline: plan -> validate_plan."""
+    """Compiled LangGraph pipeline: reason <-> tools -> finalize -> validate_plan."""
 
     def __init__(self, llm: Any, schema: DomainSchema | Any | None = None):
-        self._llm = llm.with_structured_output(DecompositionPlan)
-        self._schema = schema or DomainSchema()
+        self._schema = schema if schema is not None else DynamicSchemaRegistry()
+        self._tools = build_schema_tools(self._schema)
+        self._tool_llm = llm.bind_tools(self._tools)
+        self._structured_llm = llm.with_structured_output(DecompositionPlan)
         self._graph = self._build()
 
     def _build(self) -> Any:
         graph: StateGraph[PlannerState] = StateGraph(PlannerState)
-        graph.add_node("plan", self._plan)
+        graph.add_node("reason", self._reason)
+        graph.add_node("tools", ToolNode(self._tools))
+        graph.add_node("finalize", self._finalize)
         graph.add_node("validate_plan", self._validate_plan)
-        graph.add_edge(START, "plan")
-        graph.add_edge("plan", "validate_plan")
+        graph.add_edge(START, "reason")
+        graph.add_conditional_edges("reason", self._route_after_reason, {"tools": "tools", "finalize": "finalize"})
+        graph.add_edge("tools", "reason")
+        graph.add_edge("finalize", "validate_plan")
         graph.add_edge("validate_plan", END)
         return graph.compile()
 
-    async def _plan(self, state: PlannerState) -> dict[str, Any]:
-        intent = state["intent"]
-        human = (
-            f"{self._schema.as_prompt_context()}\n\n"
-            f"User intent: category={intent.category} domain={intent.domain} "
-            f"action={intent.action} parameters={intent.parameters}"
-        )
-        plan: DecompositionPlan = await self._llm.ainvoke([("system", _SYSTEM_PROMPT), ("human", human)])
+    def _route_after_reason(self, state: PlannerState) -> str:
+        if state.get("tool_rounds", 0) >= _MAX_TOOL_ROUNDS:
+            return "finalize"
+        return tools_condition(dict(state), messages_key="messages").replace("__end__", "finalize")
+
+    async def _reason(self, state: PlannerState) -> dict[str, Any]:
+        existing = state.get("messages") or []
+        new_messages: list[Any] = []
+
+        if not existing:
+            intent = state["intent"]
+            human = (
+                f"User intent: category={intent.category} domain={intent.domain} "
+                f"action={intent.action} parameters={intent.parameters}"
+            )
+            new_messages = [SystemMessage(content=_SYSTEM_PROMPT), ("human", human)]
+            existing = new_messages
+
+        response: AIMessage = await self._tool_llm.ainvoke(existing)
+        increment = 1 if getattr(response, "tool_calls", None) else 0
+        # new_messages (the seed, only present on the first call) plus the
+        # response both get appended to state via the add_messages reducer.
+        return {"messages": [*new_messages, response], "tool_rounds": state.get("tool_rounds", 0) + increment}
+
+    async def _finalize(self, state: PlannerState) -> dict[str, Any]:
+        messages = list(state.get("messages", [])) + [("human", _FINALIZE_PROMPT)]
+        plan: DecompositionPlan = await self._structured_llm.ainvoke(messages)
         return {"plan": plan}
 
     async def _validate_plan(self, state: PlannerState) -> dict[str, Any]:
