@@ -266,7 +266,7 @@ class OrchestratorNode(BaseAgent):
     async def _finalize_subtree(self, subtree_id: str) -> MessageEnvelope | None:
         """Aggregate subtree results and respond to the original caller."""
         results = self._subtree_mgr.collect_results(subtree_id)
-        aggregated = self._aggregator.aggregate(results)
+        aggregated = await self._aggregator.aggregate(results)
         parent_envelope = self._subtree_mgr.get_parent_envelope(subtree_id)
 
         await self._subtree_mgr.gc(subtree_id)

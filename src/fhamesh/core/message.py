@@ -130,6 +130,7 @@ class QueryResult:
     fields_redacted: list[str] = field(default_factory=list)
     noise_applied: bool = False
     error_message: str = ""
+    summary: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

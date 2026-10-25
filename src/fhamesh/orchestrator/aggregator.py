@@ -6,6 +6,7 @@ QueryResult, tracking total privacy budget and all redactions.
 
 from __future__ import annotations
 
+import abc
 import logging
 from typing import Any
 
@@ -14,7 +15,21 @@ from ..core.message import QueryResult
 logger = logging.getLogger(__name__)
 
 
-class ResultAggregator:
+class BaseAggregator(abc.ABC):
+    """Abstract interface for result aggregators.
+
+    Subclass this to plug in any aggregation backend. aggregate() is
+    async so backends that reason over an LLM (see fhamesh.agents) can
+    await a model call without blocking the agent's event loop.
+    """
+
+    @abc.abstractmethod
+    async def aggregate(self, results: list[QueryResult]) -> QueryResult:
+        """Merge a list of sub-query results into one QueryResult."""
+        ...
+
+
+class ResultAggregator(BaseAggregator):
     """Merges sub-query results into a unified QueryResult.
 
     Strategies:
@@ -25,7 +40,7 @@ class ResultAggregator:
     - Success: True only if all sub-results succeeded
     """
 
-    def aggregate(self, results: list[QueryResult]) -> QueryResult:
+    async def aggregate(self, results: list[QueryResult]) -> QueryResult:
         """Merge a list of sub-query results."""
         if not results:
             return QueryResult(success=False, error_message="No results to aggregate")
