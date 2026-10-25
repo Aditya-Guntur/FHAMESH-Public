@@ -19,6 +19,7 @@ from ..security.rbac import RBACEnforcer
 from .aggregator import ResultAggregator
 from .decomposer import QueryDecomposer
 from .mesh import PeerMesh
+from .schema import DomainSchema
 from .subtree import SubtreeManager
 from .uncertainty import UncertaintyEstimator
 from .validator import ExecutionPathValidator
@@ -46,6 +47,7 @@ class OrchestratorNode(BaseAgent):
         self._validator = ExecutionPathValidator(cfg.get("validation"))
         self._uncertainty = UncertaintyEstimator(cfg.get("uncertainty"))
         self._decomposer = QueryDecomposer(cfg.get("decomposition"))
+        self._schema = DomainSchema()
         self._subtree_mgr = SubtreeManager(self)
         self._aggregator = ResultAggregator()
         self._peer_mesh = PeerMesh(self)
@@ -118,8 +120,8 @@ class OrchestratorNode(BaseAgent):
 
         attestation: PolicyAttestation | None = None
         if self._policy_engine and token:
-            resource = self._decomposer._resolve_table(intent)
-            fields = self._decomposer._resolve_fields(intent)
+            resource = self._schema.resolve_table(intent.domain, intent.parameters.get("table"))
+            fields = self._schema.resolve_fields(intent.domain, intent.action, intent.parameters.get("fields"))
 
             verdict, attestation = await self._policy_engine.evaluate(
                 envelope=envelope,
