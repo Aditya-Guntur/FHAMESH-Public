@@ -60,6 +60,15 @@ class OrchestratorNode(BaseAgent):
         self._policy_engine: PolicyEngine | None = None
         self._rbac: RBACEnforcer | None = None
 
+        self._coordinator: Any = None
+        from ..agents.llm import build_ollama_llm
+
+        coordinator_llm = build_ollama_llm((cfg.get("agents") or {}).get("ollama"))
+        if coordinator_llm is not None:
+            from ..agents.coordinator_graph import CoordinatorGraph
+
+            self._coordinator = CoordinatorGraph(coordinator_llm, self._peer_query, schema=self._schema)
+
     async def start(
         self,
         transport: RedisTransport,
@@ -155,6 +164,18 @@ class OrchestratorNode(BaseAgent):
 
         # Step 4: Decompose
         sub_queries = await self._decomposer.decompose(intent)
+
+        # Step 4b: Cross-domain consensus — if the plan genuinely spans more
+        # than one domain, ask each target domain's own peer orchestrator
+        # for relevant context before locking in the plan. See
+        # fhamesh.agents.coordinator_graph for why this is a real
+        # distributed negotiation and not just parallel fetches.
+        target_domains = {sq["domain"] for sq in sub_queries}
+        if intent.parameters.get("cross_domain") and len(target_domains) > 1 and self._coordinator is not None:
+            try:
+                sub_queries = await self._coordinator.run(intent, sub_queries, envelope)
+            except Exception:
+                self.logger.warning("Cross-domain coordination failed, using draft plan", exc_info=True)
 
         for sq in sub_queries:
             sq["user_id"] = user_id
@@ -295,11 +316,43 @@ class OrchestratorNode(BaseAgent):
             return self._build_response(parent_envelope, aggregated)
         return None
 
+    async def _peer_query(
+        self, domain: str, query: dict[str, Any], envelope: MessageEnvelope,
+    ) -> dict[str, Any] | None:
+        """Ask a peer orchestrator a question and return its reply payload.
+
+        Bound into CoordinatorGraph as peer_query_fn — this is the only
+        place that touches PeerMesh/the transport, so the coordinator
+        graph itself stays testable with a plain fake callable.
+        """
+        response = await self._peer_mesh.request_peer(domain, query, envelope)
+        return response.payload if response else None
+
     async def _handle_peer_request(self, envelope: MessageEnvelope) -> MessageEnvelope | None:
-        """Handle a request from a peer orchestrator."""
-        self.logger.info(
-            "Peer request from %s", envelope.source_agent_id,
-        )
+        """Handle a request from a peer orchestrator.
+
+        action="describe_context" backs the cross-domain coordinator agent
+        (see fhamesh.agents.coordinator_graph): a peer wants to know what
+        this domain actually has, before a joint plan is finalized — not
+        row data, just the schema this orchestrator owns.
+        """
+        action = envelope.payload.get("action", "")
+        if action == "describe_context":
+            intent_data = envelope.payload.get("intent", {})
+            intent = IntentDescriptor.from_dict(intent_data)
+            fields = self._schema.resolve_fields(self.domain, intent.action)
+            self.logger.info("Peer %s asked for context on domain %s", envelope.source_agent_id, self.domain)
+            return envelope.reply(
+                message_type=MessageType.PEER_RESPONSE.value,
+                payload={
+                    "domain": self.domain,
+                    "table": self._schema.resolve_table(self.domain),
+                    "known_fields": fields,
+                },
+                source_agent_id=self.agent_id,
+            )
+
+        self.logger.info("Peer request from %s", envelope.source_agent_id)
         return envelope.reply(
             message_type=MessageType.PEER_RESPONSE.value,
             payload={"status": "acknowledged", "domain": self.domain},
