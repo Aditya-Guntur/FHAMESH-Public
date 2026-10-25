@@ -28,8 +28,13 @@ class BaseClassifier(abc.ABC):
     """
 
     @abc.abstractmethod
-    async def classify(self, text: str) -> IntentDescriptor:
-        """Classify sanitized user input into an IntentDescriptor."""
+    async def classify(self, text: str, user_id: str = "") -> IntentDescriptor:
+        """Classify sanitized user input into an IntentDescriptor.
+
+        user_id is optional context for backends that keep short-term
+        session memory (see fhamesh.leaf.memory.SessionMemory) — the
+        regex classifier ignores it.
+        """
         ...
 
 
@@ -50,7 +55,7 @@ class IntentClassifier(BaseClassifier):
         self._action_patterns: dict[str, list[tuple[str, re.Pattern[str]]]] = {}
         self._load_default_patterns()
 
-    async def classify(self, text: str) -> IntentDescriptor:
+    async def classify(self, text: str, user_id: str = "") -> IntentDescriptor:
         """Classify user input into structured intent.
 
         Returns IntentDescriptor with category, domain, action, and confidence.

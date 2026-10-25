@@ -53,6 +53,7 @@ def build_classifier(
     cfg: dict[str, Any] | None = None,
     agents_cfg: dict[str, Any] | None = None,
     schema: Any | None = None,
+    memory: Any | None = None,
 ) -> BaseClassifier:
     from ..leaf.classifier import IntentClassifier
 
@@ -65,7 +66,7 @@ def build_classifier(
 
     from .classifier_graph import LangGraphClassifier
 
-    return LangGraphClassifier(_merged(cfg, agents_cfg), schema=schema)
+    return LangGraphClassifier(_merged(cfg, agents_cfg), schema=schema, memory=memory)
 
 
 def build_decomposer(

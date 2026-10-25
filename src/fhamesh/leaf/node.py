@@ -45,7 +45,8 @@ class LeafNode(BaseAgent):
     Constraints:
     - No access to backend systems or sensitive data
     - No deep reasoning or response synthesis
-    - No visibility into historical state beyond the current turn
+    - Short-term memory is structured turns only (domain/action/
+      parameters via SessionMemory), TTL'd, never raw user text
     """
 
     def __init__(
@@ -57,10 +58,14 @@ class LeafNode(BaseAgent):
         cfg = self.config
 
         from ..orchestrator.schema_registry import DynamicSchemaRegistry
+        from .memory import SessionMemory
 
         self._schema = DynamicSchemaRegistry()
+        self._memory = SessionMemory()
         self._sanitizer = InputSanitizer(cfg.get("sanitizer"))
-        self._classifier = build_classifier(cfg.get("classifier"), cfg.get("agents"), schema=self._schema)
+        self._classifier = build_classifier(
+            cfg.get("classifier"), cfg.get("agents"), schema=self._schema, memory=self._memory,
+        )
         self._router = DomainRouter(cfg.get("domains"))
         self._gate = EligibilityGate(cfg.get("eligibility"))
 
@@ -75,6 +80,7 @@ class LeafNode(BaseAgent):
         await super().start(transport, registry, middleware, token_minter, audit)
         self._schema.set_redis(transport.redis)
         await self._schema.load()
+        self._memory.set_redis(transport.redis)
 
     async def handle_message(self, envelope: MessageEnvelope) -> MessageEnvelope | None:
         """Process an incoming user request.
@@ -99,7 +105,7 @@ class LeafNode(BaseAgent):
             return self._build_rejection(envelope, "Input failed safety checks")
 
         # Step 2: Classify intent
-        intent = await self._classifier.classify(sanitized)
+        intent = await self._classifier.classify(sanitized, user_id=user_id)
         intent.sanitized = True
         intent.raw_input_hash = self._sanitizer.compute_hash(raw_input)
 

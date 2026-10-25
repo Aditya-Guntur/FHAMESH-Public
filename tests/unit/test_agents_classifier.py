@@ -18,6 +18,7 @@ from fhamesh.agents.classifier_graph import (
 )
 from fhamesh.core.types import IntentCategory
 from fhamesh.leaf.classifier import IntentClassifier
+from fhamesh.leaf.memory import SessionMemory
 
 
 class _FakeStructuredLLM:
@@ -94,6 +95,77 @@ class TestClassificationGraphToolLoop:
 
         assert intent.domain == "hr"
         assert llm._tool_llm.calls <= 4
+
+
+class _CapturingToolLLM:
+    """Records the messages it was called with, so a test can check
+    whether recalled history actually made it into the prompt."""
+
+    def __init__(self):
+        self.seen_messages = []
+
+    async def ainvoke(self, messages):
+        self.seen_messages = list(messages)
+        return AIMessage(content="no tools needed")
+
+
+class _CapturingLLM:
+    def __init__(self, extraction: IntentExtraction):
+        self.tool_llm = _CapturingToolLLM()
+        self._extraction = extraction
+
+    def bind_tools(self, tools):
+        return self.tool_llm
+
+    def with_structured_output(self, schema):
+        return _FakeStructuredLLM(self._extraction)
+
+
+class TestClassificationGraphMemory:
+    async def test_recalled_history_reaches_the_prompt(self):
+        memory = SessionMemory()
+        await memory.record_turn("alice", "hr", "lookup_salary", {"department": "engineering"})
+
+        extraction = IntentExtraction(category="query", domain="finance", action="aggregate_revenue", confidence=0.9)
+        llm = _CapturingLLM(extraction)
+        graph = ClassificationGraph(llm, min_confidence=0.3, memory=memory)
+
+        await graph.run("and in sales?", user_id="alice")
+
+        human_messages = [m for m in llm.tool_llm.seen_messages if isinstance(m, tuple) and m[0] == "human"]
+        assert any("domain=hr" in m[1] for m in human_messages)
+        assert any("and in sales?" in m[1] for m in human_messages)
+
+    async def test_new_turn_is_recorded_after_classification(self):
+        memory = SessionMemory()
+        extraction = IntentExtraction(category="query", domain="product", action="list_catalog", confidence=0.8)
+        graph = ClassificationGraph(_FakeLLM(_FakeStructuredLLM(extraction)), min_confidence=0.3, memory=memory)
+
+        await graph.run("show me the catalog", user_id="alice")
+
+        turns = await memory.recall("alice")
+        assert len(turns) == 1
+        assert turns[0]["domain"] == "product"
+        assert turns[0]["action"] == "list_catalog"
+
+    async def test_no_memory_configured_is_a_noop(self):
+        """ClassificationGraph with memory=None (the default) should work exactly as before."""
+        extraction = IntentExtraction(category="query", domain="hr", action="lookup_salary", confidence=0.9)
+        graph = ClassificationGraph(_FakeLLM(_FakeStructuredLLM(extraction)), min_confidence=0.3)
+
+        intent = await graph.run("salary?", user_id="alice")
+
+        assert intent.domain == "hr"
+
+    async def test_empty_user_id_skips_memory_without_error(self):
+        memory = SessionMemory()
+        extraction = IntentExtraction(category="query", domain="hr", action="lookup_salary", confidence=0.9)
+        graph = ClassificationGraph(_FakeLLM(_FakeStructuredLLM(extraction)), min_confidence=0.3, memory=memory)
+
+        intent = await graph.run("salary?")  # no user_id
+
+        assert intent.domain == "hr"
+        assert await memory.recall("") == []
 
 
 class TestClassificationGraph:
