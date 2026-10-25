@@ -451,11 +451,14 @@ async def cmd_health(args: argparse.Namespace) -> None:
 
     print("\nAgent Health Status:")
     print("-" * 40)
+    backend_keys = ("classifier_backend", "decomposer_backend", "aggregator_backend")
     for agent in runner._agents:
         try:
             health = await agent.health_check()
             status = health.get("status", "unknown")
-            print(f"  {agent.agent_id}: {status}")
+            backend_parts = [f"{key.removesuffix('_backend')}={health[key]}" for key in backend_keys if key in health]
+            suffix = f" [{', '.join(backend_parts)}]" if backend_parts else ""
+            print(f"  {agent.agent_id}: {status}{suffix}")
         except Exception as exc:
             print(f"  {agent.agent_id}: ERROR ({exc})")
     print("-" * 40)
