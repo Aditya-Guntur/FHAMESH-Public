@@ -13,11 +13,11 @@ import json
 import logging
 from typing import Any
 
+from ..agents.factory import build_classifier
 from ..core.agent import BaseAgent
 from ..core.message import IntentDescriptor, MessageEnvelope
 from ..core.types import AgentLayer, MessageType
 from ..security.credentials import ScopedToken
-from .classifier import IntentClassifier
 from .gate import EligibilityGate
 from .router import DomainRouter
 from .sanitizer import InputSanitizer
@@ -49,7 +49,7 @@ class LeafNode(BaseAgent):
         super().__init__(layer=AgentLayer.LEAF, domain=domain, config=config or {})
         cfg = self.config
         self._sanitizer = InputSanitizer(cfg.get("sanitizer"))
-        self._classifier = IntentClassifier(cfg.get("classifier"))
+        self._classifier = build_classifier(cfg.get("classifier"), cfg.get("agents"))
         self._router = DomainRouter(cfg.get("domains"))
         self._gate = EligibilityGate(cfg.get("eligibility"))
 

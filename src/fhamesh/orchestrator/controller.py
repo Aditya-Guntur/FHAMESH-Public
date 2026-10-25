@@ -10,14 +10,13 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from ..agents.factory import build_aggregator, build_decomposer
 from ..core.agent import BaseAgent
 from ..core.message import IntentDescriptor, MessageEnvelope, QueryResult
 from ..core.types import AgentLayer, MessageType, PolicyVerdict
 from ..security.credentials import ScopedToken
 from ..security.policy import PolicyAttestation, PolicyEngine, RateLimiter
 from ..security.rbac import RBACEnforcer
-from .aggregator import ResultAggregator
-from .decomposer import QueryDecomposer
 from .mesh import PeerMesh
 from .schema import DomainSchema
 from .subtree import SubtreeManager
@@ -46,10 +45,10 @@ class OrchestratorNode(BaseAgent):
         cfg = self.config
         self._validator = ExecutionPathValidator(cfg.get("validation"))
         self._uncertainty = UncertaintyEstimator(cfg.get("uncertainty"))
-        self._decomposer = QueryDecomposer(cfg.get("decomposition"))
+        self._decomposer = build_decomposer(cfg.get("decomposition"), cfg.get("agents"))
         self._schema = DomainSchema()
         self._subtree_mgr = SubtreeManager(self)
-        self._aggregator = ResultAggregator()
+        self._aggregator = build_aggregator(cfg.get("aggregation"), cfg.get("agents"))
         self._peer_mesh = PeerMesh(self)
         self._policy_engine: PolicyEngine | None = None
         self._rbac: RBACEnforcer | None = None

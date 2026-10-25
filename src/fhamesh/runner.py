@@ -135,11 +135,13 @@ class MeshRunner:
         # Leaf node
         leaf_config = self._config.leaf.model_dump()
         leaf_config["domains"] = self._config.domains.model_dump()
+        leaf_config["agents"] = self._config.agents.model_dump()
         leaf_config["token_ttl_seconds"] = self._config.security.token_ttl_seconds
         leaf = LeafNode(domain="general", config=leaf_config)
 
         # Orchestrator node
         orch_config = self._config.orchestrator.model_dump()
+        orch_config["agents"] = self._config.agents.model_dump()
         orch_config["token_ttl_seconds"] = self._config.security.token_ttl_seconds
         orch = OrchestratorNode(domain="general", config=orch_config)
         orch.set_policy_engine(policy_engine)
