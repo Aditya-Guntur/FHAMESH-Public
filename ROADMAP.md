@@ -14,9 +14,13 @@ FHAMESH is a **working framework** with a complete security pipeline, 116 passin
 | RBAC | Complete | Role/field-level permissions, wildcard support |
 | Policy engine | Complete | RBAC + rate limiting + signed attestations |
 | Input sanitization | Complete | 16+ regex patterns (SQL injection, XSS, prompt injection, etc.) |
-| Intent classification | Complete | LangGraph agent (Ollama), regex fallback, pluggable via BaseClassifier |
-| Query planning | Complete | LangGraph agent (Ollama), rule-based fallback, pluggable via BaseDecomposer |
-| Result synthesis | Complete | LangGraph agent (Ollama) writes a summary, merge-only fallback |
+| Intent classification | Complete | LangGraph agent (Ollama), tool use + session memory, regex fallback |
+| Query planning | Complete | LangGraph agent (Ollama), tool use + dynamic schema, rule-based fallback |
+| Result synthesis | Complete | LangGraph agent (Ollama), tool use + self-verification, merge-only fallback |
+| Cross-domain consensus | Complete | PeerMesh-backed coordinator agent reconciles multi-domain plans |
+| Dynamic schema registry | Complete | Runtime domain registration, Redis-shared, no redeploy needed |
+| Session memory | Complete | Structured per-user turn history, Redis-backed, TTL'd |
+| Streaming responses | Complete | Opt-in STREAM_CHUNK live synthesis preview |
 | Differential privacy | Complete | Laplace mechanism, per-user epsilon budget in Redis |
 | PII redaction | Complete | Regex detection, configurable masking strategies |
 | Row-level security | Complete | Role-based WHERE predicate injection |
@@ -133,28 +137,45 @@ Currently all agents run in a single Python process via `asyncio.create_task()`.
 
 ---
 
-## Phase 4: LLM-Powered Orchestrator — Partially Shipped
+## Phase 4: LLM-Powered Orchestrator — Shipped
 
-**Status:** The query planner and result synthesizer are done. Streaming
-and formal guardrail integration are not.
+**Status:** Query planning and result synthesis are both done, each with
+real tool use, and the two originally-flagged gaps (guardrails,
+streaming) are closed too.
 
-- Done — `fhamesh.agents.decomposer_graph.LangGraphDecomposer`: a `plan`
-  (LLM) → `validate_plan` (deterministic) agent. The LLM only ever sees
-  the already-classified `IntentDescriptor` and the known
-  `DomainSchema` (table/field names) — never row data, since
+- Done — `fhamesh.agents.decomposer_graph.LangGraphDecomposer`: a ReAct
+  loop (`plan` ⇄ `tools` → `finalize` → `validate_plan`). The model can
+  call `list_domains` / `describe_domain` against `DynamicSchemaRegistry`
+  instead of guessing, and the LLM only ever sees the already-classified
+  `IntentDescriptor` plus schema metadata — never row data, since
   decomposition runs before DataCore executes anything. An invalid
-  table/field proposal is corrected by the validate node, not trusted.
+  table/field proposal is corrected by `validate_plan`, not trusted.
 - Done — `fhamesh.agents.aggregator_graph.LangGraphAggregator`: `merge`
   (unchanged, deterministic — privacy budget accounting stays exact) →
-  `synthesize` (LLM writes `QueryResult.summary` from the merged,
-  already DP-noised/PII-redacted data).
-- Both fall back to the Phase-0 deterministic implementation per call
-  if Ollama is unreachable.
-- Not done — **Guardrails**: the uncertainty estimator runs on the
-  *intent*, before planning; it isn't yet wired to validate the LLM's
-  *plan* or *summary* output beyond the schema check in
-  `validate_plan`.
-- Not done — **Streaming responses**: no `MessageType.STREAM_CHUNK` yet.
+  `reason ⇄ tools` (can call `compute_percentage_change` /
+  `format_currency` instead of doing arithmetic itself) → `synthesize`
+  → `verify`.
+- Done — **Guardrails**: `verify` is a second, independent structured
+  LLM call that fact-checks the drafted summary against the actual
+  merged data and corrects or drops it if something doesn't hold up.
+  Still a gap: the uncertainty estimator itself runs only on the
+  *intent*, before planning — it isn't integrated with `verify`'s
+  output.
+- Done — **Streaming responses**: `MessageType.STREAM_CHUNK` plus
+  `RedisTransport.request_stream()`. Strictly opt-in
+  (`leaf.streaming.enabled` + `orchestrator.streaming.enabled`, both
+  default `false`) — a plain `request()` caller is unaffected either
+  way. `SynthesisGraph.astream()` is a live text preview; the
+  authoritative, verified summary still comes from `aggregate()`.
+- Also shipped, beyond the original Phase 4 scope — `CoordinatorGraph`:
+  when a query genuinely spans more than one domain, each target
+  domain's own orchestrator is asked (over `PeerMesh`, not a shared
+  database) what it has, before the plan is finalized. And
+  `SessionMemory`: the classifier's `recall`/`record` nodes let a
+  follow-up question use the previous turn's domain as context,
+  without ever storing raw text.
+- Every LangGraph agent falls back to its Phase-0/1 deterministic
+  implementation per call if Ollama is unreachable.
 
 **Goal:** Let orchestrators use LLMs for query decomposition and result synthesis.
 
@@ -255,5 +276,5 @@ For someone picking this up:
 2. **Phase 2** (storage) — now the highest-impact remaining item, connects to real data
 3. **Phase 5** (hardening) — do in parallel with 2, especially TLS and key rotation
 4. **Phase 3** (multi-process) — enables real deployment
-5. ~~**Phase 4** (LLM orchestrator)~~ — planner + synthesizer shipped; guardrail integration and streaming remain
+5. ~~**Phase 4** (LLM orchestrator)~~ — shipped: planner, synthesizer, tool use, guardrails, streaming, cross-domain consensus, session memory
 6. **Phase 6** (frontend) — last mile, makes it usable by non-developers
