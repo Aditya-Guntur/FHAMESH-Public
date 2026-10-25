@@ -1,0 +1,34 @@
+domains:
+  hr:
+    description: "Human Resources queries — employee data, salaries, departments"
+    intent_patterns:
+      - "salary|compensation|employee|hiring|department|staff|team|manager"
+    orchestrator_domain: "hr"
+    datacore_tables:
+      - employees
+
+  finance:
+    description: "Financial queries — orders, revenue, expenses"
+    intent_patterns:
+      - "order|revenue|expense|budget|transaction|payment|invoice|cost"
+    orchestrator_domain: "finance"
+    datacore_tables:
+      - orders
+
+  product:
+    description: "Product catalog queries"
+    intent_patterns:
+      - "product|catalog|item|inventory|stock|price|category"
+    orchestrator_domain: "product"
+    datacore_tables:
+      - products
+
+  general:
+    description: "General queries — fallback domain"
+    intent_patterns:
+      - ".*"
+    orchestrator_domain: "general"
+    datacore_tables:
+      - employees
+      - products
+      - orders

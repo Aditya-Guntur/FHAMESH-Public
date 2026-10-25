@@ -1,0 +1,92 @@
+site_name: FHAMESH Documentation
+site_description: Federated Hierarchical Agent Mesh with Zero Trust Orchestration
+site_url: https://aditya-guntur.github.io/Federated/
+repo_url: https://github.com/Aditya-Guntur/Federated
+repo_name: Aditya-Guntur/Federated
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - content.code.copy
+    - toc.follow
+  icon:
+    repo: fontawesome/brands/github
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            show_source: false
+            show_root_heading: true
+            show_root_full_path: false
+            heading_level: 3
+            members_order: source
+            show_signature_annotations: true
+            separate_signature: true
+            docstring_style: google
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - toc:
+      permalink: true
+  - attr_list
+  - def_list
+
+nav:
+  - Home: index.md
+  - Architecture: architecture.md
+  - Quick Start: quickstart.md
+  - Security:
+    - Overview: security/overview.md
+    - Zero Trust Tokens: security/zero-trust.md
+    - RBAC: security/rbac.md
+    - Privacy & PII: security/privacy.md
+  - Guides:
+    - Extending the Framework: guides/extending.md
+    - Configuration Reference: guides/configuration.md
+  - Tutorials:
+    - Input Sanitization: tutorials/input-sanitization.md
+    - Intent Classification: tutorials/intent-classification.md
+    - Zero Trust Tokens: tutorials/zero-trust-tokens.md
+    - RBAC Access Control: tutorials/rbac-access-control.md
+    - Row-Level Security: tutorials/row-level-security.md
+    - Storage & Queries: tutorials/storage-queries.md
+    - Differential Privacy: tutorials/differential-privacy.md
+    - PII Redaction: tutorials/pii-redaction.md
+    - Adversarial Detection: tutorials/adversarial-detection.md
+    - Message Envelopes: tutorials/message-envelopes.md
+    - End-to-End Pipeline: tutorials/end-to-end-pipeline.md
+  - API Reference:
+    - Core: api/core.md
+    - Security: api/security.md
+    - Leaf Layer: api/leaf.md
+    - Orchestrator: api/orchestrator.md
+    - Data Core: api/datacore.md
+    - Bus & Transport: api/bus.md
+    - Config: api/config.md

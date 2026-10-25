@@ -1,0 +1,51 @@
+[project]
+name = "fhamesh"
+version = "0.1.0"
+description = "Federated Hierarchical Agent Mesh with Zero Trust Orchestration"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+dependencies = [
+    "redis>=5.0",
+    "pyyaml>=6.0",
+    "pydantic>=2.0",
+    "pycryptodome>=3.20",
+    "aiosqlite>=0.20",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "fakeredis>=2.21",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+docs = [
+    "mkdocs>=1.6",
+    "mkdocs-material>=9.5,<9.7",
+    "mkdocstrings[python]>=0.27",
+]
+
+[project.scripts]
+fhamesh = "fhamesh.runner:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true

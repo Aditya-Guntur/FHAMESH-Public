@@ -1,0 +1,52 @@
+roles:
+  admin:
+    permissions:
+      - resource: "*"
+        action: "*"
+    max_query_depth: 10
+    rate_limit_per_minute: 1000
+
+  analyst:
+    permissions:
+      - resource: "employees"
+        action: "read"
+        fields:
+          - name
+          - department
+          - title
+          - salary
+      - resource: "orders"
+        action: "read"
+        fields:
+          - order_id
+          - amount
+          - date
+          - customer_name
+    max_query_depth: 3
+    rate_limit_per_minute: 60
+
+  viewer:
+    permissions:
+      - resource: "products"
+        action: "read"
+        fields:
+          - product_id
+          - name
+          - category
+          - price
+      - resource: "employees"
+        action: "read"
+        fields:
+          - name
+          - department
+          - title
+    max_query_depth: 1
+    rate_limit_per_minute: 30
+
+rate_limits:
+  global:
+    requests_per_minute: 100
+    burst: 20
+  per_user:
+    requests_per_minute: 30
+    burst: 10

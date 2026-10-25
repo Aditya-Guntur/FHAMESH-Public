@@ -1,0 +1,1192 @@
+================================================================================
+FHAMESH - IMPLEMENTATION DEEP DIVE
+Federated Hierarchical Agent Mesh with Zero Trust Orchestration
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1.  What Is FHAMESH
+2.  Why This Architecture Exists
+3.  The Agents - What They Are and What They Do
+4.  The Message Envelope - How Agents Talk
+5.  The Transport Layer - Redis Pub/Sub
+6.  The Request/Reply Pattern - How Responses Find Their Way Back
+7.  Zero Trust Security - Token Lifecycle (Full Detail)
+8.  Layer 1: Leaf Node - Edge Processing
+9.  Layer 2: Orchestrator Node - Logic and Policy
+10. Layer 3: Data Core Node - Storage, Privacy, PII
+11. Full Query Walkthrough - Every Single Step
+12. Compromise Scenarios - What Happens When Things Go Wrong
+13. Differential Privacy - The Math
+14. RBAC - Field-Level Access Control
+15. Audit Trail - Tamper-Evident Logging
+16. Current Implementation vs Production Vision
+17. File-by-File Reference
+
+
+================================================================================
+1. WHAT IS FHAMESH
+================================================================================
+
+FHAMESH is a Python framework for building secure, distributed agent systems
+that let users query sensitive databases through natural language while the
+system automatically enforces privacy, access control, and auditability.
+
+It is NOT a chatbot. It is NOT an LLM wrapper. It is a security pipeline
+that agents (currently rule-based, eventually LLM-powered) operate inside.
+
+The core guarantee: a user gets answers to their questions, but the system
+mathematically ensures that no individual's data is exposed, every access is
+authorized, and every query is auditable.
+
+
+================================================================================
+2. WHY THIS ARCHITECTURE EXISTS
+================================================================================
+
+The problem: Organizations have sensitive data (HR records, financial data,
+customer information) that employees need to query. Traditional approaches
+have fundamental gaps:
+
+Traditional DB access control:
+- Security is enforced at ONE point (the database)
+- If you get past that one layer, you see everything
+- No privacy guarantees on aggregate queries
+- No protection against slow data harvesting
+
+Single LLM + RAG:
+- The LLM sees raw data directly
+- Prompt injection can leak data
+- No mathematical privacy guarantees
+- No per-query budget enforcement
+
+FHAMESH solves this by creating THREE independent security boundaries.
+Each boundary enforces its own guarantees. Compromising one does not
+compromise the others. This is defense-in-depth at the application layer.
+
+
+================================================================================
+3. THE AGENTS - WHAT THEY ARE AND WHAT THEY DO
+================================================================================
+
+An "agent" in FHAMESH is a Python class that:
+- Inherits from BaseAgent
+- Has a unique ID (e.g., "leaf:general", "orchestrator:hr")
+- Subscribes to a Redis channel
+- Receives messages, processes them, sends responses
+- Runs as an async coroutine
+
+Currently 5 agents run in the demo:
+
+  leaf:general        - The single edge node. All user queries enter here.
+  orchestrator:hr     - Handles HR domain queries (salary, employees)
+  orchestrator:finance - Handles finance domain queries (orders, revenue)
+  orchestrator:product - Handles product domain queries (catalog, pricing)
+  datacore:main       - The single data backend. All DB queries go through here.
+
+In production, you would have many more - multiple leaf nodes for load
+balancing, one datacore per database, etc.
+
+IMPORTANT: These agents currently use keyword matching and rule-based logic.
+There are NO LLMs in the system right now. The agents are essentially
+secure middleware nodes. The framework is designed so that LLMs can be
+plugged in later (via abstract base classes) while the security pipeline
+remains unchanged.
+
+
+================================================================================
+4. THE MESSAGE ENVELOPE - HOW AGENTS TALK
+================================================================================
+
+Every single communication between agents is wrapped in a MessageEnvelope.
+This is a frozen (immutable) Python dataclass. Once created, it cannot be
+modified - you can only create a new one.
+
+Fields in a MessageEnvelope:
+
+  message_id          - Unique ID (UUID hex, 16 chars)
+  correlation_id      - Links related messages in a request/response chain
+  message_type        - What kind of message (e.g., "intent_request", "query_response")
+  source_agent_id     - Who sent this message
+  target_agent_id     - Who should receive this message
+  timestamp           - When the message was created (Unix time)
+  payload             - The actual content (dictionary of key-value pairs)
+  auth_token          - JSON string of the ScopedToken (the security credential)
+  policy_attestation  - JSON string of the PolicyAttestation (proof that policy was checked)
+  parent_message_id   - ID of the message this is responding to
+  subtree_id          - For query decomposition (tracks which subtree this belongs to)
+  ttl_seconds         - Time-to-live (default 30 seconds, then message is considered expired)
+  hop_count           - How many agents this message has passed through
+  max_hops            - Maximum allowed hops (prevents infinite routing loops)
+
+Key methods:
+  content_hash()  - SHA-256 of the payload. Used in audit logs. The audit log
+                    NEVER stores raw content, only this hash.
+  is_expired()    - Checks if the message has exceeded its TTL.
+  to_bytes()      - Serializes to JSON bytes for Redis transport.
+  from_bytes()    - Deserializes from JSON bytes received from Redis.
+
+
+================================================================================
+5. THE TRANSPORT LAYER - REDIS PUB/SUB
+================================================================================
+
+Agents communicate EXCLUSIVELY through Redis pub/sub. They share no memory,
+no function calls, no direct references. This is what makes them distributable
+across separate processes or machines.
+
+How it works:
+
+1. Each agent subscribes to its own channel:
+   - leaf:general subscribes to "fhamesh:agent:leaf:general"
+   - orchestrator:hr subscribes to "fhamesh:agent:orchestrator:hr"
+   - datacore:main subscribes to "fhamesh:agent:datacore:main"
+
+2. To send a message to an agent, you publish to its channel.
+
+3. The ChannelRouter determines the correct channel from the envelope:
+   - It reads target_agent_id from the envelope
+   - Constructs the channel name: "fhamesh:agent:{target_agent_id}"
+
+4. Messages are serialized as JSON bytes (envelope.to_bytes()) before
+   publishing, and deserialized (MessageEnvelope.from_bytes()) on receipt.
+
+Redis is used for:
+- Pub/sub message transport (agent-to-agent communication)
+- Agent registry (who is alive, what layer, what domain)
+- Rate limiting (sorted sets with sliding window counters)
+- Privacy budget tracking (per-user epsilon spent)
+- Temporary reply channels (for request/response patterns)
+
+
+================================================================================
+6. THE REQUEST/REPLY PATTERN
+================================================================================
+
+Normal pub/sub is fire-and-forget. But FHAMESH needs synchronous
+request/response (send a query, wait for the answer). Here is exactly
+how this works:
+
+Step 1: The sender creates a temporary reply channel
+  reply_channel = "fhamesh:reply:{random_uuid}"
+
+Step 2: The sender subscribes to that reply channel
+
+Step 3: The sender injects the reply channel into the message payload
+  payload["_reply_channel"] = reply_channel
+
+Step 4: The sender publishes the message to the target's normal channel
+
+Step 5: The target agent processes the message. When it creates a response,
+  BaseAgent._process_raw_message() copies _reply_channel from the inbound
+  message to the outbound response.
+
+Step 6: BaseAgent.send() checks if the response has a _reply_channel.
+  If yes, it publishes to that specific channel instead of the normal
+  routing (which would go to "fhamesh:agent:{target_id}").
+
+Step 7: The original sender receives the response on the temporary channel.
+
+Step 8: The temporary channel is unsubscribed and cleaned up.
+
+This happens at EVERY hop in the chain:
+  Runner -> Leaf        (reply channel A)
+  Leaf -> Orchestrator  (reply channel B)
+  Orchestrator -> DataCore (reply channel C)
+
+Each hop has its OWN temporary reply channel. When DataCore responds to
+the Orchestrator, it uses reply channel C. When the Orchestrator responds
+to the Leaf, it uses reply channel B. When the Leaf responds to the
+Runner, it uses reply channel A.
+
+
+================================================================================
+7. ZERO TRUST SECURITY - TOKEN LIFECYCLE (FULL DETAIL)
+================================================================================
+
+"Zero trust" means: no agent trusts any other agent by default. Every
+message must carry a cryptographic proof of authorization. This proof is
+the ScopedToken.
+
+--- What is a ScopedToken ---
+
+A ScopedToken is a frozen dataclass with these fields:
+
+  token_id            - Unique identifier (UUID hex, 16 chars)
+  issuer_agent_id     - Who created this token (e.g., "runner:client")
+  subject_agent_id    - Who this token is intended for (e.g., "leaf:general")
+  layer               - Which layer this token is valid for ("leaf", "orchestrator", "datacore")
+  domain              - Which domain ("hr", "finance", "product", "general")
+  allowed_actions     - List of actions this token permits (e.g., ["intent_request", "query"])
+  issued_at           - Unix timestamp when the token was created
+  expires_at          - Unix timestamp when the token expires (issued_at + ttl)
+  scoped_fields       - Optional: which data fields the token allows access to
+  role                - The user's role (e.g., "admin", "analyst", "viewer")
+  user_id             - The user's identity (e.g., "alice")
+  signature           - HMAC-SHA256 signature of all the above fields
+
+--- How tokens are created (TokenMinter) ---
+
+The TokenMinter holds a signing key (a secret string, minimum 32 bytes).
+
+  1. Create the token with all claims filled in
+  2. Serialize the claims (without signature) to JSON, sorted by key
+  3. Compute: HMAC-SHA256(signing_key, claims_json_bytes) -> hex string
+  4. Attach the signature to the token
+  5. Serialize the complete token to JSON
+  6. Attach the JSON string to the MessageEnvelope's auth_token field
+
+--- How tokens are verified (CredentialVerifier) ---
+
+The CredentialVerifier holds signing keys for ALL layers:
+  { "leaf": key_A, "orchestrator": key_B, "datacore": key_C }
+
+When a message arrives:
+
+  1. Extract the token JSON from the envelope's auth_token field
+  2. Parse it back into a ScopedToken
+  3. Read the token's claimed layer (e.g., "orchestrator")
+  4. Look up the signing key for that layer
+  5. Recompute the HMAC: HMAC-SHA256(layer_key, claims_json_bytes)
+  6. Compare the computed signature with the token's signature
+     - Uses hmac.compare_digest() for CONSTANT TIME comparison
+     - This prevents timing attacks where an attacker measures how long
+       the comparison takes to guess the correct signature byte by byte
+  7. Check TTL: is time.time() > expires_at? If yes, reject.
+  8. Check actions: is the requested action in allowed_actions?
+  9. Check target: does subject_agent_id match the receiving agent?
+
+If ANY check fails, the message is DROPPED. The agent never sees it.
+
+--- Key distribution ---
+
+CRITICAL: Each layer has a DIFFERENT signing key.
+
+  Runner knows:        leaf_signing_key
+  Leaf knows:          leaf_signing_key + orchestrator_signing_key
+  Orchestrator knows:  orchestrator_signing_key + datacore_signing_key
+  DataCore knows:      datacore_signing_key
+
+This means:
+  - A token signed for the leaf layer CANNOT be used at the orchestrator
+  - A token signed for the orchestrator CANNOT be used at the datacore
+  - At each hop, the sending agent mints a BRAND NEW token with the
+    NEXT layer's signing key
+
+Token chain for a single query:
+
+  Runner mints Token_1 using leaf_signing_key:
+    issuer=runner:client, subject=leaf:general, layer=leaf
+    -> attached to message Runner -> Leaf
+
+  Leaf VERIFIES Token_1 using leaf_signing_key: valid
+  Leaf mints Token_2 using orchestrator_signing_key:
+    issuer=leaf:general, subject=orchestrator:hr, layer=orchestrator
+    -> attached to message Leaf -> Orchestrator
+
+  Orchestrator VERIFIES Token_2 using orchestrator_signing_key: valid
+  Orchestrator mints Token_3 using datacore_signing_key:
+    issuer=orchestrator:hr, subject=datacore:main, layer=datacore
+    -> attached to message Orchestrator -> DataCore
+
+  DataCore VERIFIES Token_3 using datacore_signing_key: valid
+  DataCore processes the query.
+
+Token_1 is DEAD after the leaf uses it. It cannot be reused, replayed,
+or forwarded. Each hop gets its own fresh token with its own signature.
+
+
+================================================================================
+8. LAYER 1: LEAF NODE - EDGE PROCESSING
+================================================================================
+
+File: src/fhamesh/leaf/node.py
+
+The Leaf is the ONLY entry point into the mesh. All user queries arrive here.
+It performs NO reasoning, NO data access. Its job is: clean, classify, route.
+
+Processing pipeline (in order):
+
+--- Step 1: Input Sanitization ---
+File: src/fhamesh/leaf/sanitizer.py
+
+Assumes ALL input is adversarial. Checks for:
+
+  SQL Injection (8 patterns):
+    - UNION SELECT
+    - DROP TABLE/DATABASE/INDEX
+    - DELETE FROM
+    - INSERT INTO
+    - UPDATE ... SET
+    - SQL comments (-- or /* */ or ;--)
+    - OR bypass ('1'='1')
+    - Semicolon followed by destructive command
+
+  XSS / Script Injection (4 patterns):
+    - <script> tags
+    - Event handlers (onclick=, onload=, etc.)
+    - javascript: URLs
+    - <iframe> tags
+
+  Prompt Injection (4 patterns):
+    - "Ignore all previous instructions"
+    - "System prompt" / "new instructions" / "override rules"
+    - "You are now" / "pretend to be" / "act as"
+    - "DAN mode" / "developer mode" / "jailbreak"
+
+  Path Traversal (1 pattern):
+    - ../ or ..\ or %2e%2e
+
+  Command Injection (1 pattern):
+    - ; cat, | ls, ` rm, etc.
+
+Also:
+  - Unicode NFC normalization (prevents homoglyph attacks where a Cyrillic "a"
+    is used instead of a Latin "a" to bypass pattern matching)
+  - Control character stripping (keeps newlines/tabs, removes everything else)
+  - Length limit enforcement (default 2000 characters)
+
+If ANY pattern matches, the input is REJECTED. The query never proceeds.
+
+--- Step 2: Intent Classification ---
+File: src/fhamesh/leaf/classifier.py
+
+Takes the sanitized text and produces an IntentDescriptor:
+  - category: the type of query (e.g., "data_query", "lookup")
+  - domain: which business domain ("hr", "finance", "product")
+  - action: specific action ("lookup_salary", "aggregate_revenue")
+  - confidence: how certain the classifier is (0.0 to 1.0)
+  - raw_input_hash: SHA-256 of the original input (for audit)
+
+Currently uses keyword matching:
+  "salary" or "employee" -> domain: hr
+  "order" or "revenue" -> domain: finance
+  "product" or "catalog" -> domain: product
+
+This is the main plug-in point. Replace IntentClassifier with a subclass
+of BaseClassifier that calls Ollama, HuggingFace, or any NLU model.
+The rest of the pipeline doesn't change.
+
+--- Step 3: Domain Routing ---
+File: src/fhamesh/leaf/router.py
+
+Maps the classified domain to a specific orchestrator:
+  "hr" -> "orchestrator:hr"
+  "finance" -> "orchestrator:finance"
+  "product" -> "orchestrator:product"
+
+--- Step 4: Eligibility Gate ---
+File: src/fhamesh/leaf/eligibility.py
+
+Checks if the user is allowed to make queries at all (before RBAC).
+This is a coarse filter - e.g., is the user's account active? Is their
+IP in the allowed range? Are they in the allowed user list?
+
+--- Step 5: Forward to Orchestrator ---
+
+The Leaf uses transport.request() to send the classified intent to the
+appropriate orchestrator and WAITS for a response (synchronous request/reply).
+
+It mints a NEW token using the orchestrator's signing key before sending.
+
+When the response comes back from the orchestrator, the Leaf relays it
+back to the original caller (the Runner).
+
+
+================================================================================
+9. LAYER 2: ORCHESTRATOR NODE - LOGIC AND POLICY
+================================================================================
+
+File: src/fhamesh/orchestrator/controller.py
+
+The Orchestrator is the decision-making layer. It determines IF a query
+should proceed and HOW it should be executed.
+
+Processing pipeline:
+
+--- Step 1: Token Verification ---
+
+Already happened in the middleware before the orchestrator sees the message.
+The orchestrator_signing_key was used to verify the token's HMAC signature.
+
+--- Step 2: RBAC Enforcement ---
+File: src/fhamesh/security/rbac.py
+
+Role-Based Access Control with FIELD-LEVEL granularity.
+
+Roles are defined in config/policies.yaml:
+
+  admin:
+    permissions:
+      - resource: "*"           # all resources
+        action: "*"             # all actions
+        fields: []              # all fields (empty = no restriction)
+    max_query_depth: 10
+    rate_limit_per_minute: 120
+
+  analyst:
+    permissions:
+      - resource: "hr.employee"
+        action: "read"
+        fields: ["name", "department", "title"]    # NO salary field
+      - resource: "hr.salary"
+        action: "read"
+        fields: ["department", "average"]           # Only aggregates
+      - resource: "finance.orders"
+        action: "read"
+        fields: []
+
+  viewer:
+    permissions:
+      - resource: "hr.employee"
+        action: "read"
+        fields: ["name", "department"]              # Very limited
+
+How RBAC checking works:
+  1. Extract role from the token (e.g., "analyst")
+  2. Extract resource from the query (e.g., "hr.salary")
+  3. Extract action (e.g., "read")
+  4. Extract requested fields (e.g., ["name", "salary", "department"])
+  5. Look up the role's permissions
+  6. Check: does ANY permission match the resource + action?
+  7. If fields are specified in the permission, check: are ALL requested
+     fields in the allowed list?
+  8. Wildcard: "*" matches everything (admin only)
+
+If RBAC denies: the query stops HERE. DataCore never sees it.
+
+--- Step 3: Uncertainty Estimation ---
+File: src/fhamesh/orchestrator/uncertainty.py
+
+Checks if the classified intent "makes sense". Designed to catch
+adversarial inputs that bypass the sanitizer but produce suspicious
+classifications.
+
+Checks:
+  - Is the domain-action pair valid? (e.g., "hr" + "lookup_salary" = valid,
+    "hr" + "delete_all" = suspicious)
+  - Is the confidence score above threshold?
+  - Does the input length ratio suggest stuffing/padding attacks?
+  - Are there anomalous patterns in the parameters?
+
+If the uncertainty score exceeds the threshold, the query is flagged as
+potentially adversarial and rejected.
+
+--- Step 4: Policy Engine ---
+File: src/fhamesh/security/policy.py
+
+Combines RBAC + rate limiting into a single evaluation:
+
+  a. Rate Limiter (Redis-backed sliding window):
+     - Uses Redis sorted sets
+     - Each request adds a timestamped entry
+     - Counts entries in the last 60 seconds
+     - If count > role's rate_limit_per_minute: RATE_LIMITED
+     - Entries older than the window are automatically pruned
+
+  b. RBAC check (as described above)
+
+  c. If all checks pass: creates a PolicyAttestation
+     - This is a SIGNED proof that the orchestrator checked policy
+     - Contains: agent_id, policy_name, verdict, timestamp
+     - Signed with HMAC-SHA256 using the policy engine's signing key
+     - Attached to the message so downstream agents can verify
+       that policy was enforced upstream
+
+--- Step 5: Query Decomposition ---
+File: src/fhamesh/orchestrator/decomposer.py
+
+For complex queries, the orchestrator can break them into sub-queries:
+  "Average salary by department" could become:
+    Sub-query 1: Get avg salary for engineering
+    Sub-query 2: Get avg salary for finance
+    Sub-query 3: Get avg salary for marketing
+
+Each sub-query runs as an isolated subtree with its own subtree_id.
+
+--- Step 6: Forward to DataCore ---
+
+Mints a NEW token using the datacore's signing key. Sends via
+transport.request() and waits for the response.
+
+
+================================================================================
+10. LAYER 3: DATA CORE NODE - STORAGE, PRIVACY, PII
+================================================================================
+
+File: src/fhamesh/datacore/node.py
+
+The Data Core is the ONLY layer that touches actual data. No other layer
+has database access. This is the innermost security boundary.
+
+Processing pipeline:
+
+--- Step 1: Token Verification ---
+
+Middleware verifies the datacore token using datacore_signing_key.
+
+--- Step 2: Query Validation ---
+File: src/fhamesh/datacore/query_validator.py
+
+Validates the query structure. Ensures:
+  - Table name is in the allowed list (no arbitrary table access)
+  - Requested fields are valid for that table
+  - Query type is allowed (SELECT only, no INSERT/UPDATE/DELETE)
+  - Parameters are within expected ranges
+
+--- Step 3: Row-Level Security ---
+File: src/fhamesh/datacore/rls.py
+
+RLS restricts WHICH ROWS the user can see based on their role.
+
+This is different from RBAC (which restricts which RESOURCES and FIELDS).
+
+Examples:
+  admin:             No row restrictions (sees everything)
+  engineering_lead:  employees WHERE department = 'engineering'
+  finance_viewer:    employees WHERE department = 'finance'
+  analyst:           All rows (but RBAC limits which fields they see)
+
+How it works:
+  1. Read the role from the token
+  2. Look up the RLS policy for that role + table combination
+  3. Build an RLSContext with predicates (e.g., {department: 'engineering'})
+  4. The storage backend injects these predicates as WHERE clauses
+  5. The query only returns rows that match the predicates
+
+So even if RBAC allows "hr.employee.read", RLS might restrict it to
+only engineering department employees. Two layers of filtering.
+
+--- Step 4: Query Execution ---
+File: src/fhamesh/datacore/storage.py
+
+Currently uses SQLite (in-memory, seeded with demo data). The storage
+backend is an abstract class (StorageBackend) - implement PostgresBackend
+or any other backend by subclassing.
+
+The SQLite backend:
+  - Seeds 15 employee records, 15 order records, 15 product records
+  - Applies RLS predicates as WHERE clauses
+  - Returns results as a dictionary with "rows", "row_count", "fields"
+
+--- Step 5: Differential Privacy ---
+File: src/fhamesh/datacore/privacy.py
+
+THIS IS THE MATHEMATICAL PRIVACY GUARANTEE.
+
+What it does:
+  After the query returns real data, noise is added to every numeric field.
+
+How the Laplace mechanism works:
+
+  The Laplace distribution is a probability distribution centered at 0.
+  When you add Laplace noise to a value, the result is randomly shifted
+  by a small amount. The amount of noise is controlled by two parameters:
+
+  Sensitivity: How much one person's data could change the result.
+    - For salary data, sensitivity = 50,000 (one person's salary could
+      change an average by up to $50,000 in a small department)
+    - For age, sensitivity = 1.0
+    - For order amounts, sensitivity = 1,000
+
+  Epsilon: The privacy parameter. Smaller epsilon = more noise = more privacy.
+    - epsilon = 0.1: very noisy, very private
+    - epsilon = 1.0: moderate noise, moderate privacy
+    - epsilon = 10.0: little noise, less private
+
+  Noise formula: sample from Laplace(0, sensitivity / epsilon)
+    scale = sensitivity / epsilon
+    noise = numpy.random.laplace(0, scale)
+    noisy_value = real_value + noise
+
+  Example with salary data (sensitivity=50000, epsilon=1.0):
+    scale = 50000 / 1.0 = 50000
+    noise might be +12,345 or -8,921 (random each time)
+    Real average salary: $142,000
+    Reported salary: $154,345 (or $133,079, different each time)
+
+The mathematical guarantee (epsilon-differential privacy):
+  For any single individual added to or removed from the dataset,
+  the probability of any output changes by at most a factor of e^epsilon.
+  This means you cannot determine whether any specific person's data
+  was included in the query result.
+
+--- Epsilon Budget ---
+
+Each user has a TOTAL privacy budget (default: 10.0 epsilon).
+
+Every query consumes some epsilon. When the budget is exhausted,
+the system REFUSES to answer any more queries.
+
+  Query 1: alice queries salary data, consumes epsilon=1.0. Budget: 9.0 remaining.
+  Query 2: alice queries salary data again, consumes epsilon=1.0. Budget: 8.0.
+  ...
+  Query 10: alice queries again. Budget: 0.0. DENIED.
+
+This prevents the data harvesting attack: you can't just keep querying
+with slight variations to average out the noise and reconstruct exact values.
+
+Budget tracking is in Redis:
+  Key: "fhamesh:privacy_budget:{user_id}"
+  Value: total epsilon spent so far
+  TTL: 24 hours (budget resets daily by default)
+
+Budget is tracked CENTRALLY in Redis, across all databases and domains.
+So querying HR data AND finance data spends from the SAME budget.
+
+--- Step 6: PII Sanitization ---
+File: src/fhamesh/datacore/pii.py
+
+After noise is applied, the PIISanitizer scans all result fields for
+personally identifiable information.
+
+Detection patterns:
+  email:       regex matching user@domain.com patterns
+  phone:       regex matching 123-456-7890 patterns
+  ssn:         regex matching 123-45-6789 patterns
+  credit_card: regex matching 1234-5678-9012-3456 patterns
+  ip_address:  regex matching 192.168.1.1 patterns
+
+Masking strategies:
+  full:          "John Smith" -> "[REDACTED]"
+  last4:         "123-45-6789" -> "***6789"
+  email_domain:  "john@company.com" -> "***@company.com"
+  first_initial: "John Smith" -> "J***"
+
+Field-based masking:
+  ssn field -> always "last4" strategy
+  email field -> always "email_domain" strategy
+  phone field -> always "full" strategy
+
+Pattern-based detection:
+  Even if a field is not named "email", if its VALUE matches an email
+  pattern, it gets masked. This catches PII that leaks into unexpected
+  fields (e.g., a "notes" field containing "contact john@company.com").
+
+--- Step 7: Return Response ---
+
+The DataCore packages everything into a response envelope:
+  - The noisy, PII-stripped data
+  - Privacy budget consumed
+  - Fields that were redacted
+  - Whether noise was applied
+  - The response flows back through the reply channel system
+
+
+================================================================================
+11. FULL QUERY WALKTHROUGH - EVERY SINGLE STEP
+================================================================================
+
+User: "Show me salary data for engineering department"
+User: alice, Role: admin
+
+--- Phase A: Runner Initialization ---
+
+1.  Runner creates a RedisTransport and connects to Redis
+2.  Runner creates all 5 agents (leaf, 3 orchestrators, 1 datacore)
+3.  Each agent connects its own transport and subscribes to its channel
+4.  Each agent registers itself in the Redis-backed AgentRegistry
+5.  Runner stores a reference to the Leaf's TokenMinter
+
+--- Phase B: Query Submission ---
+
+6.  Runner registers "runner:client" as a pseudo-agent in the registry
+    (so middleware doesn't reject it as an unknown source)
+
+7.  Runner mints a ScopedToken:
+      issuer: "runner:client"
+      subject: "leaf:general"
+      layer: "leaf"
+      allowed_actions: ["intent_request", "query"]
+      role: "admin"
+      user_id: "alice"
+      ttl: 30 seconds
+      signature: HMAC-SHA256(leaf_key, claims)
+
+8.  Runner creates a MessageEnvelope:
+      source: "runner:client"
+      target: "leaf:general"
+      payload: {query: "Show me salary data for engineering department",
+                user_id: "alice", role: "admin"}
+      auth_token: <token JSON from step 7>
+
+9.  Runner calls transport.request(envelope):
+      a. Creates reply channel "fhamesh:reply:a1b2c3d4e5f6"
+      b. Subscribes to that channel
+      c. Waits 50ms for subscription to stabilize
+      d. Injects _reply_channel into payload
+      e. Publishes to "fhamesh:agent:leaf:general"
+      f. Starts waiting for response on the reply channel
+
+--- Phase C: Leaf Processing ---
+
+10. Leaf's listen loop receives the message on "fhamesh:agent:leaf:general"
+
+11. Leaf's middleware runs:
+      a. Deserializes MessageEnvelope from bytes
+      b. Extracts auth_token
+      c. Parses ScopedToken from JSON
+      d. CredentialVerifier checks:
+         - Layer "leaf" has a known key: YES
+         - HMAC signature valid: YES (recomputed and compared)
+         - TTL expired: NO (0.3 seconds old, TTL is 30)
+         - Action "intent_request" in allowed_actions: YES
+      e. MessageMiddleware checks:
+         - Source "runner:client" in registry: YES
+         - hop_count (0) < max_hops (10): YES
+      -> MESSAGE ACCEPTED
+
+12. LeafNode.handle_message() runs:
+      a. InputSanitizer.sanitize("Show me salary data for engineering department"):
+         - Length: 51 chars < 2000: OK
+         - Unicode NFC normalization: done
+         - Control char stripping: none found
+         - Injection pattern check (18 patterns): NONE DETECTED
+         -> Returns ("Show me salary data for engineering department", True)
+
+      b. IntentClassifier.classify():
+         - Keyword "salary" detected -> domain: "hr", action: "lookup_salary"
+         - Keyword "engineering" detected -> parameter: department=engineering
+         - Confidence: 0.85
+         -> Returns IntentDescriptor(domain="hr", action="lookup_salary",
+              confidence=0.85, parameters={department: "engineering"})
+
+      c. DomainRouter.route("hr") -> "orchestrator:hr"
+
+      d. EligibilityGate.check("alice") -> PASS
+
+      e. Leaf mints a NEW token:
+           issuer: "leaf:general"
+           subject: "orchestrator:hr"
+           layer: "orchestrator"
+           signature: HMAC-SHA256(orchestrator_key, claims)   <-- DIFFERENT KEY
+
+      f. Leaf calls transport.request(forward_envelope):
+           Creates reply channel "fhamesh:reply:x7y8z9w0a1b2"
+           Publishes to "fhamesh:agent:orchestrator:hr"
+           Waits for response...
+
+--- Phase D: Orchestrator Processing ---
+
+13. Orchestrator:hr receives the message
+
+14. Middleware verifies:
+      - Token layer "orchestrator", key matches: YES
+      - HMAC valid: YES
+      - TTL valid: YES
+      -> ACCEPTED
+
+15. OrchestratorNode.handle_message() runs:
+      a. RBACEnforcer.check("admin", "hr.salary", "read", []):
+         - Admin has permission: resource="*", action="*"
+         - Wildcard matches everything
+         -> ALLOWED
+
+      b. UncertaintyEstimator.evaluate():
+         - Domain "hr" + action "lookup_salary": valid pair
+         - Confidence 0.85 > threshold 0.5
+         - No anomalous patterns
+         -> confidence=0.85, is_adversarial=False
+
+      c. PolicyEngine.evaluate():
+         - RateLimiter: alice has made 0 requests this minute, limit is 120
+         -> UNDER LIMIT
+         - RBAC: already checked above -> ALLOW
+         - Creates PolicyAttestation:
+             agent_id: "orchestrator:hr"
+             policy_name: "rbac_and_rate_limit"
+             verdict: "ALLOW"
+             signature: HMAC-SHA256(policy_key, attestation)
+
+      d. Orchestrator mints a NEW token:
+           issuer: "orchestrator:hr"
+           subject: "datacore:main"
+           layer: "datacore"
+           signature: HMAC-SHA256(datacore_key, claims)       <-- THIRD KEY
+
+      e. Orchestrator calls transport.request(datacore_envelope):
+           Creates reply channel "fhamesh:reply:m3n4o5p6q7r8"
+           Publishes to "fhamesh:agent:datacore:main"
+           Waits for response...
+
+--- Phase E: DataCore Processing ---
+
+16. DataCore:main receives the message
+
+17. Middleware verifies:
+      - Token layer "datacore", key matches: YES
+      - HMAC valid: YES
+      -> ACCEPTED
+
+18. DataCoreNode.handle_message() runs:
+      a. QueryValidator validates:
+         - Table "employees": in allowed list -> OK
+         - Query type: read -> OK
+
+      b. RowLevelSecurity.build_context_for_table("employees"):
+         - Role "admin" -> no RLS predicates (admin sees everything)
+         -> RLSContext(role="admin", predicates={})
+
+      c. SQLiteBackend.execute():
+         - Query: SELECT * FROM employees
+         - RLS predicates: none (admin)
+         - User query filtered by department=engineering
+         - Returns: 15 rows of employee data with name, department,
+           title, salary, email, phone
+
+      d. DifferentialPrivacyEngine:
+         i.  check_budget("alice"):
+             Redis GET "fhamesh:privacy_budget:alice" -> 0.0
+             0.0 < 10.0 (max budget) -> HAS BUDGET
+
+         ii. apply(data, query):
+             For each row, for each numeric field:
+               salary field:
+                 sensitivity = 50000.0
+                 epsilon = 1.0
+                 scale = 50000.0 / 1.0 = 50000.0
+                 noise = numpy.random.laplace(0, 50000.0)
+                 e.g., real salary 95000 + noise 12345 = 107345
+             Total epsilon consumed: 1.0 per row x 15 rows = 15.0
+             (capped to query epsilon of 1.0 for budget purposes)
+
+         iii. deduct_budget("alice", 1.0):
+              Redis SETEX "fhamesh:privacy_budget:alice" 86400 "1.0"
+              (86400 seconds = 24 hours TTL)
+
+      e. PIISanitizer.sanitize():
+         - Scans each row for PII patterns
+         - email fields: "john@company.com" -> "***@company.com"
+         - phone fields: "555-123-4567" -> "[REDACTED]"
+         - SSN fields (if any): "123-45-6789" -> "***6789"
+
+      f. Build response envelope with:
+         - Noisy, PII-stripped data
+         - privacy_budget_consumed: 1.0
+         - fields_redacted: ["email", "phone"]
+         - noise_applied: True
+
+--- Phase F: Response Propagation ---
+
+19. DataCore publishes response to reply channel "fhamesh:reply:m3n4o5p6q7r8"
+    (the orchestrator's temporary channel)
+
+20. Orchestrator receives response, relays back on "fhamesh:reply:x7y8z9w0a1b2"
+    (the leaf's temporary channel)
+
+21. Leaf receives response, relays back on "fhamesh:reply:a1b2c3d4e5f6"
+    (the runner's temporary channel)
+
+22. Runner receives the final response
+    - Strips _reply_channel from payload
+    - Prints the results to the user
+
+Total time: ~200ms on localhost.
+Total tokens minted: 3 (one per layer crossing)
+Total tokens verified: 3 (one per layer)
+Total temporary reply channels created: 3 (one per hop)
+All 3 reply channels are cleaned up after use.
+
+
+================================================================================
+12. COMPROMISE SCENARIOS
+================================================================================
+
+--- Scenario 1: Leaf Node Compromised ---
+
+Attacker gains: leaf_signing_key + orchestrator_signing_key
+Attacker can:
+  - Read all incoming user queries (plaintext)
+  - Forge leaf tokens (useless, they already control the leaf)
+  - Forge orchestrator tokens (can send messages to orchestrator)
+  - Craft queries that look like they came from any user
+
+Attacker CANNOT:
+  - Forge datacore tokens (doesn't have datacore_signing_key)
+  - Bypass RBAC at the orchestrator (still enforced)
+  - Get raw data (datacore still adds noise, strips PII)
+  - Tamper with audit logs (written at orchestrator + datacore)
+  - Talk directly to the database
+
+Damage: Can see what users are asking. Can impersonate users at the
+orchestrator level. But responses are still privacy-protected.
+
+--- Scenario 2: Orchestrator Compromised ---
+
+Attacker gains: orchestrator_signing_key + datacore_signing_key
+Attacker can:
+  - Forge orchestrator tokens (controls this layer)
+  - Forge datacore tokens (can query the database layer directly)
+  - Bypass RBAC (controls the enforcer)
+  - Bypass rate limiting (controls the rate limiter)
+
+Attacker CANNOT:
+  - Forge leaf tokens (doesn't have leaf_signing_key)
+  - Intercept raw user queries at the edge
+  - Bypass datacore's OWN security (query validation, RLS, DP, PII)
+  - Get raw data (noise is still applied, PII is still stripped)
+
+Damage: More serious. Can query any domain's datacore. But the data
+returned is still noisy and PII-stripped.
+
+--- Scenario 3: DataCore Compromised ---
+
+Attacker gains: datacore_signing_key + raw database access
+Attacker can:
+  - Read the raw database (game over for this database)
+  - Bypass differential privacy (controls the engine)
+  - Bypass PII redaction (controls the sanitizer)
+
+Attacker CANNOT:
+  - Forge leaf or orchestrator tokens
+  - Compromise OTHER datacores (each has its own key)
+  - Move laterally (can only access the one database they control)
+
+Damage: Full access to one database. But only one. And audit logs at
+the orchestrator layer still record all queries.
+
+--- Scenario 4: Redis Compromised ---
+
+Attacker gains: access to the message bus
+Attacker can:
+  - Read all messages in transit (they contain auth tokens)
+  - Read epsilon budgets, registry data, rate limit counters
+  - Potentially replay messages (but tokens expire in 30 seconds)
+  - Inject messages (but they need valid token signatures)
+
+Mitigation: TLS for Redis connections (in the roadmap). Token TTLs
+mean stolen tokens are useless after 30 seconds.
+
+
+================================================================================
+13. DIFFERENTIAL PRIVACY - THE MATH
+================================================================================
+
+Formal definition (epsilon-differential privacy):
+
+A randomized mechanism M satisfies epsilon-differential privacy if for
+any two datasets D1 and D2 that differ by at most one record, and for
+any set of possible outputs S:
+
+  P[M(D1) in S] <= e^epsilon * P[M(D2) in S]
+
+In plain English: whether or not any single person's data is in the
+dataset, the output looks almost the same. The "almost" is controlled
+by epsilon. Smaller epsilon = outputs are more similar = more privacy.
+
+The Laplace mechanism achieves this by adding noise drawn from:
+  Laplace(0, sensitivity / epsilon)
+
+Where sensitivity is the maximum change in the query result that any
+single person's data could cause.
+
+Why this matters in practice:
+
+WITHOUT differential privacy:
+  Query 1: "Average salary" -> $142,000 (100 employees)
+  Query 2: "Average salary" (after Bob leaves) -> $141,500 (99 employees)
+  Attacker computes: Bob's salary = 100 * 142000 - 99 * 141500 = $151,500
+
+  This is called a "differencing attack". With enough queries, every
+  individual's exact data can be reconstructed.
+
+WITH differential privacy:
+  Query 1: "Average salary" -> $147,234 (noised)
+  Query 2: "Average salary" -> $138,891 (noised differently)
+  Attacker computes: ??? (noise makes differencing useless)
+  After 10 queries: epsilon budget exhausted, no more answers.
+
+The combination of noise + budget is what provides the guarantee.
+
+
+================================================================================
+14. RBAC - FIELD-LEVEL ACCESS CONTROL
+================================================================================
+
+RBAC in FHAMESH is more granular than typical role-based systems.
+It controls access at THREE levels:
+
+Level 1: Resource
+  Can this role access this resource at all?
+  admin: resource="*" (everything)
+  analyst: resource="hr.employee" (yes), resource="products" (no)
+
+Level 2: Action
+  What can this role do with this resource?
+  admin: action="*" (everything)
+  analyst: action="read" (only read, no write/delete)
+
+Level 3: Field
+  Which specific fields can this role see?
+  admin: fields=[] (all fields, no restriction)
+  analyst: fields=["name", "department", "title"] (no salary!)
+  viewer: fields=["name", "department"] (even less)
+
+The wildcard "*" matches everything. Only admin roles should have wildcards.
+
+Example denials:
+  Bob (analyst) asks for product data:
+    RBAC checks: analyst has no "products.*" permission -> DENIED
+
+  Charlie (viewer) asks for salary data:
+    RBAC checks: viewer has "hr.employee" but fields are ["name", "department"]
+    "salary" is not in the allowed fields -> DENIED
+
+  Alice (admin) asks for salary data:
+    RBAC checks: admin has resource="*", action="*", fields=[] -> ALLOWED
+
+RBAC is enforced at the ORCHESTRATOR layer, not at the database.
+This means a denied query never touches the database at all.
+
+
+================================================================================
+15. AUDIT TRAIL - TAMPER-EVIDENT LOGGING
+================================================================================
+
+File: src/fhamesh/security/audit.py
+
+Every message processed by any agent is logged. The audit log stores:
+
+  timestamp           - When the event occurred (Unix time, millisecond precision)
+  direction           - "inbound" or "outbound"
+  agent_id            - Which agent logged this event
+  message_id          - Unique ID of the message
+  correlation_id      - Links all messages in a request/response chain
+  message_type        - Type of message
+  source_agent_id     - Who sent the message
+  target_agent_id     - Who received the message
+  content_hash        - SHA-256 of the message payload
+  hop_count           - How many agents the message has passed through
+  subtree_id          - For decomposed queries
+  confidence          - Classifier confidence (if applicable)
+  attestation_id      - ID of the PolicyAttestation (if applicable)
+  policy_verdict      - ALLOW / DENY / RATE_LIMITED
+
+CRITICAL: The audit log NEVER stores raw content. Only the SHA-256 hash
+of the payload. This means:
+  - If someone compromises the audit log, they see hashes, not data
+  - The hashes can still be used to verify that a specific payload
+    was processed (hash the suspected payload, compare)
+  - Tamper detection: if anyone modifies the payload after logging,
+    the hash won't match
+
+The log is append-only (SQLite INSERT only, no UPDATE or DELETE).
+Indexed by correlation_id (trace a full request) and agent_id + timestamp
+(audit a specific agent's activity).
+
+In production, this would export to a SIEM (Splunk, ELK, etc.) for
+real-time anomaly detection.
+
+
+================================================================================
+16. CURRENT IMPLEMENTATION VS PRODUCTION VISION
+================================================================================
+
+What works RIGHT NOW:
+  - All 5 agents run and communicate through Redis
+  - Zero-trust tokens are minted, signed, and verified at every hop
+  - Input sanitization catches real injection patterns
+  - RBAC enforcement with field-level permissions
+  - Differential privacy with real Laplace noise
+  - Per-user epsilon budget tracking in Redis
+  - PII detection and masking
+  - Row-level security
+  - Append-only audit logging
+  - 116 automated tests
+  - Interactive and demo modes
+  - MkDocs documentation site
+
+What is STUBBED (works, but with simple implementations):
+  - Intent classifier: keyword matching (needs LLM/NLU)
+  - Storage backend: in-memory SQLite with demo data (needs PostgreSQL)
+  - All agents in one process (needs multi-container deployment)
+  - No TLS on Redis (needs encryption in transit)
+  - No key rotation (keys are static in config)
+  - No frontend (CLI only, needs FastAPI + web UI)
+
+The security pipeline is REAL. The data and classification are demo-grade.
+That's by design - the framework's value is the pipeline, not the data.
+
+
+================================================================================
+17. FILE-BY-FILE REFERENCE
+================================================================================
+
+src/fhamesh/
+  core/
+    agent.py         - BaseAgent class. All agents inherit from this.
+                       Handles message loop, middleware, send/receive.
+    message.py       - MessageEnvelope (frozen dataclass). The only way
+                       agents communicate. Also IntentDescriptor, QueryResult.
+    registry.py      - AgentRegistry. Redis-backed. Tracks which agents are
+                       alive, what layer/domain they serve, TTL heartbeats.
+    types.py         - Enums: AgentLayer, MessageType, IntentCategory,
+                       PolicyVerdict, DomainType.
+    errors.py        - Custom exception hierarchy: AgentError, SecurityError,
+                       TransportError, PolicyError, etc.
+
+  security/
+    credentials.py   - ScopedToken (frozen dataclass) and TokenMinter.
+                       Token creation with HMAC-SHA256 signing.
+    verifier.py      - CredentialVerifier. Validates tokens on every
+                       inbound message. Constant-time signature comparison.
+    rbac.py          - Permission, Role, RBACEnforcer. Field-level RBAC.
+    policy.py        - PolicyEngine, PolicyAttestation, RateLimiter.
+                       Combines RBAC + rate limiting. Signs attestations.
+    audit.py         - AuditLogger. SQLite append-only log with content hashes.
+
+  bus/
+    transport.py     - RedisTransport. Async pub/sub. publish(), listen(),
+                       request() (synchronous request/reply with temp channels).
+    channels.py      - ChannelRouter. Maps agent IDs to Redis channel names.
+    middleware.py     - MessageMiddleware. Runs before every message:
+                       auth check, TTL check, hop count check, registry check.
+
+  leaf/
+    node.py          - LeafNode. The edge agent. Orchestrates the edge pipeline.
+    sanitizer.py     - InputSanitizer. 18 regex patterns. Unicode normalization.
+    classifier.py    - BaseClassifier (abstract) + IntentClassifier (keyword).
+    router.py        - DomainRouter. Maps domains to orchestrator agent IDs.
+    eligibility.py   - EligibilityGate. Coarse user eligibility check.
+
+  orchestrator/
+    controller.py    - OrchestratorNode. The logic agent. RBAC + policy + routing.
+    uncertainty.py   - UncertaintyEstimator. Adversarial input detection.
+    decomposer.py    - QueryDecomposer. Breaks complex queries into subtrees.
+    mesh.py          - PeerMesh. Lateral communication between orchestrators.
+    subtree.py       - SubtreeManager. Manages isolated subtree execution.
+    aggregator.py    - ResultAggregator. Combines results from subtrees.
+    validator.py     - ExecutionPathValidator. Validates query execution plans.
+
+  datacore/
+    node.py          - DataCoreNode. The data agent. Innermost security boundary.
+    storage.py       - StorageBackend (abstract) + SQLiteBackend.
+    privacy.py       - DifferentialPrivacyEngine. Laplace noise + budget tracking.
+    pii.py           - PIISanitizer. Regex PII detection + masking strategies.
+    rls.py           - RowLevelSecurity. Role-based row filtering.
+    query_validator.py - QueryValidator. Validates query structure.
+
+  config/
+    loader.py        - ConfigLoader. Loads YAML files with Pydantic validation.
+    schemas.py       - Pydantic models for all config sections.
+
+  runner.py          - CLI entry point. Creates agents, runs demo/interactive/health.
+
+config/
+  agents.yaml        - Agent definitions (id, layer, domain)
+  transport.yaml     - Redis connection settings
+  security.yaml      - Signing keys, token TTL
+  policies.yaml      - RBAC roles and permissions
+  leaf.yaml          - Sanitizer and classifier settings
+  datacore.yaml      - Privacy, PII, RLS settings
+
+tests/
+  unit/              - Individual component tests
+  integration/       - Multi-component tests
+  e2e/               - Full pipeline tests
+  conftest.py        - Shared fixtures (fakeredis, token minters, etc.)
+
+
+================================================================================
+END OF DOCUMENT
+================================================================================

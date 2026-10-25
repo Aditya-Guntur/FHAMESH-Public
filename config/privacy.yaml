@@ -1,0 +1,16 @@
+differential_privacy:
+  default_epsilon: 1.0
+  max_budget_per_user: 1000.0
+  budget_reset_interval_hours: 24
+  field_sensitivity:
+    salary: 50000.0
+    age: 1.0
+    order_amount: 1000.0
+    count: 1.0
+
+pii:
+  mask_fields:
+    ssn: "last4"
+    email: "email_domain"
+    phone: "full"
+  detect_patterns: true
