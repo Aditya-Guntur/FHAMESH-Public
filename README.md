@@ -31,6 +31,7 @@ A pluggable Python framework for building secure, distributed agent systems. Age
 
 - **Zero Trust**: Every message carries an HMAC-SHA256 signed `ScopedToken`. Trust is never inherited — re-established at every boundary.
 - **Pluggable Agents**: Implement `BaseAgent` to create any agent type. Swap in LLM-powered, rule-based, or custom ML agents.
+- **LangGraph Reasoning Agents**: Intent classification, query planning, and result synthesis are real LangGraph agents backed by a local Ollama model — not pattern matching dressed up as "AI". Each one falls back to its deterministic counterpart per-call if the model is unreachable, so the mesh degrades gracefully instead of breaking. See [Reasoning Agents](#reasoning-agents) below.
 - **Differential Privacy**: Real Laplace mechanism with per-user epsilon budget tracking in Redis.
 - **PII Detection**: Regex-based detection with configurable masking (full redaction, last-4, email domain).
 - **Row-Level Security**: Role-based query filtering injected as WHERE predicates.
@@ -46,6 +47,7 @@ A pluggable Python framework for building secure, distributed agent systems. Age
 
 - Python 3.12+
 - Redis server running on localhost:6379
+- (Optional) [Ollama](https://ollama.com) running locally, for the LangGraph reasoning agents — without it, the mesh automatically uses the deterministic regex/rule-based backends instead
 
 ### Install
 
@@ -53,6 +55,10 @@ A pluggable Python framework for building secure, distributed agent systems. Age
 git clone https://github.com/Aditya-Guntur/Federated.git
 cd Federated
 pip install -e ".[dev]"
+
+# Optional: LangGraph reasoning agents (classification, query planning, synthesis)
+pip install -e ".[agents]"
+ollama pull llama3.2
 ```
 
 ### Run
@@ -77,7 +83,7 @@ fhamesh health
 pytest
 ```
 
-Tests use `fakeredis` — no real Redis server required. 116 tests covering security, privacy, sanitization, storage, classification, and the full pipeline.
+Tests use `fakeredis` — no real Redis server required, and the LangGraph agent tests mock the LLM boundary — no Ollama server required either. 147 tests covering security, privacy, sanitization, storage, classification, query planning, result synthesis, and the full pipeline.
 
 ## Project Structure
 
@@ -86,14 +92,47 @@ src/fhamesh/
   core/          BaseAgent, MessageEnvelope, types, errors, registry
   security/      ScopedToken, TokenMinter, CredentialVerifier, RBAC, PolicyEngine
   bus/           RedisTransport, ChannelRouter, MessageMiddleware
-  leaf/          LeafNode, IntentClassifier, DomainRouter, EligibilityGate
-  orchestrator/  OrchestratorNode, SubtreeManager, PeerMesh, UncertaintyEstimator
+  leaf/          LeafNode, IntentClassifier (regex), DomainRouter, EligibilityGate
+  orchestrator/  OrchestratorNode, QueryDecomposer (rules), ResultAggregator (merge),
+                 DomainSchema, SubtreeManager, PeerMesh, UncertaintyEstimator
+  agents/        LangGraph reasoning agents — classification, query planning, result
+                 synthesis — plus the backend factory that picks LangGraph vs.
+                 deterministic per config, with automatic per-call fallback
   datacore/      DataCoreNode, DifferentialPrivacyEngine, PIISanitizer, SQLiteBackend
   config/        ConfigLoader, Pydantic schemas
   runner.py      CLI entry point
 
 config/          YAML configuration files
 tests/           unit/, integration/, e2e/
+```
+
+## Reasoning Agents
+
+Three places in the mesh make a judgment call instead of following a fixed rule, and each one is a real [LangGraph](https://github.com/langchain-ai/langgraph) agent, not a single prompt pretending to be one:
+
+| Agent | Where | Graph | Grounded in |
+|-------|-------|-------|-------------|
+| Classification | Leaf | `extract` (LLM) → `calibrate` (deterministic confidence floor) | — |
+| Query planning | Orchestrator | `plan` (LLM) → `validate_plan` (deterministic schema check) | `DomainSchema` — known tables/fields, so the model can't invent one |
+| Result synthesis | Orchestrator | `merge` (deterministic, unchanged) → `synthesize` (LLM) | Already privacy-protected data only — the model never sees raw rows |
+
+Every agent is wrapped behind the same abstract interface its deterministic predecessor used (`BaseClassifier`, `BaseDecomposer`, `BaseAggregator`), and every one falls back to the deterministic implementation for that single call if Ollama is unreachable or returns something unusable — logged as a warning, not a failure. Pick the backend per layer in config:
+
+```yaml
+leaf:
+  classifier:
+    backend: "auto"   # auto | langgraph | regex
+
+orchestrator:
+  decomposition:
+    backend: "auto"   # auto | langgraph | rules
+  aggregation:
+    backend: "auto"   # auto | langgraph | merge
+
+agents:
+  ollama:
+    model: "llama3.2"
+    base_url: "http://localhost:11434"
 ```
 
 ## Configuration
@@ -139,7 +178,7 @@ from fhamesh.leaf.classifier import BaseClassifier
 from fhamesh.core.message import IntentDescriptor
 
 class MLClassifier(BaseClassifier):
-    def classify(self, text: str) -> IntentDescriptor:
+    async def classify(self, text: str) -> IntentDescriptor:
         # Your ML model here
         ...
 ```
@@ -176,6 +215,12 @@ All free, open source, pip-installable:
 - `pycryptodome` — HMAC-SHA256
 - `aiosqlite` — async SQLite
 - `numpy` — Laplace noise generation
+
+Optional (`pip install -e ".[agents]"`), for the LangGraph reasoning agents:
+
+- `langgraph` — agent orchestration graphs
+- `langchain-core` — structured LLM output
+- `langchain-ollama` — local model client (no API key, no external service)
 
 ## License
 
