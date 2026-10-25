@@ -14,7 +14,9 @@ FHAMESH is a **working framework** with a complete security pipeline, 116 passin
 | RBAC | Complete | Role/field-level permissions, wildcard support |
 | Policy engine | Complete | RBAC + rate limiting + signed attestations |
 | Input sanitization | Complete | 16+ regex patterns (SQL injection, XSS, prompt injection, etc.) |
-| Intent classification | Complete | Keyword/regex classifier (pluggable via BaseClassifier) |
+| Intent classification | Complete | LangGraph agent (Ollama), regex fallback, pluggable via BaseClassifier |
+| Query planning | Complete | LangGraph agent (Ollama), rule-based fallback, pluggable via BaseDecomposer |
+| Result synthesis | Complete | LangGraph agent (Ollama) writes a summary, merge-only fallback |
 | Differential privacy | Complete | Laplace mechanism, per-user epsilon budget in Redis |
 | PII redaction | Complete | Regex detection, configurable masking strategies |
 | Row-level security | Complete | Role-based WHERE predicate injection |
@@ -29,7 +31,14 @@ FHAMESH is a **working framework** with a complete security pipeline, 116 passin
 
 ---
 
-## Phase 1: Real-World Classification (Replace Keyword Classifier)
+## Phase 1: Real-World Classification (Replace Keyword Classifier) — Shipped
+
+**Status:** Done. `fhamesh.agents.classifier_graph.LangGraphClassifier` is a
+two-node LangGraph agent (`extract` → `calibrate`) backed by Ollama,
+selected by default (`leaf.classifier.backend: "auto"`), falling back
+to the keyword classifier below per-call if the model is unreachable.
+The option picked was closest to "Ollama + local LLM" — free, private,
+no API keys — via `langchain-ollama`.
 
 **Goal:** Replace the keyword/regex intent classifier with an actual NLU backend.
 
@@ -124,20 +133,32 @@ Currently all agents run in a single Python process via `asyncio.create_task()`.
 
 ---
 
-## Phase 4: LLM-Powered Orchestrator
+## Phase 4: LLM-Powered Orchestrator — Partially Shipped
+
+**Status:** The query planner and result synthesizer are done. Streaming
+and formal guardrail integration are not.
+
+- Done — `fhamesh.agents.decomposer_graph.LangGraphDecomposer`: a `plan`
+  (LLM) → `validate_plan` (deterministic) agent. The LLM only ever sees
+  the already-classified `IntentDescriptor` and the known
+  `DomainSchema` (table/field names) — never row data, since
+  decomposition runs before DataCore executes anything. An invalid
+  table/field proposal is corrected by the validate node, not trusted.
+- Done — `fhamesh.agents.aggregator_graph.LangGraphAggregator`: `merge`
+  (unchanged, deterministic — privacy budget accounting stays exact) →
+  `synthesize` (LLM writes `QueryResult.summary` from the merged,
+  already DP-noised/PII-redacted data).
+- Both fall back to the Phase-0 deterministic implementation per call
+  if Ollama is unreachable.
+- Not done — **Guardrails**: the uncertainty estimator runs on the
+  *intent*, before planning; it isn't yet wired to validate the LLM's
+  *plan* or *summary* output beyond the schema check in
+  `validate_plan`.
+- Not done — **Streaming responses**: no `MessageType.STREAM_CHUNK` yet.
 
 **Goal:** Let orchestrators use LLMs for query decomposition and result synthesis.
 
-The current `QueryDecomposer` uses rule-based decomposition. The `ResultAggregator` does simple merging. Both can be enhanced with LLM reasoning.
-
-### What to Build
-
-- **LLM query planner** — replace `QueryDecomposer.decompose()` with an LLM that generates a query execution plan
-- **Result synthesizer** — replace `ResultAggregator.aggregate()` with an LLM that produces natural language summaries
-- **Guardrails** — the uncertainty estimator already exists; integrate it with LLM output validation
-- **Streaming responses** — add a `MessageType.STREAM_CHUNK` for token-by-token output
-
-Key constraint: the LLM never sees raw data. The orchestrator sends structured queries to DataCore and receives privacy-protected results. The LLM only synthesizes the already-sanitized output.
+Key constraint (upheld): the LLM never sees raw data. The orchestrator sends structured queries to DataCore and receives privacy-protected results. The LLM only synthesizes the already-sanitized output.
 
 ---
 
@@ -230,9 +251,9 @@ User: "What is the average salary in engineering?"
 
 For someone picking this up:
 
-1. **Phase 1** (classifier) — highest impact, makes the system handle real queries
-2. **Phase 2** (storage) — second highest, connects to real data
-3. **Phase 5** (hardening) — do in parallel with 1 and 2, especially TLS and key rotation
+1. ~~**Phase 1** (classifier)~~ — shipped
+2. **Phase 2** (storage) — now the highest-impact remaining item, connects to real data
+3. **Phase 5** (hardening) — do in parallel with 2, especially TLS and key rotation
 4. **Phase 3** (multi-process) — enables real deployment
-5. **Phase 4** (LLM orchestrator) — the big differentiator
+5. ~~**Phase 4** (LLM orchestrator)~~ — planner + synthesizer shipped; guardrail integration and streaming remain
 6. **Phase 6** (frontend) — last mile, makes it usable by non-developers
