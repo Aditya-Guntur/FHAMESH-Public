@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..agents.factory import build_classifier
 from ..core.agent import BaseAgent
@@ -21,6 +21,13 @@ from ..security.credentials import ScopedToken
 from .gate import EligibilityGate
 from .router import DomainRouter
 from .sanitizer import InputSanitizer
+
+if TYPE_CHECKING:
+    from ..bus.middleware import MessageMiddleware
+    from ..bus.transport import RedisTransport
+    from ..core.registry import AgentRegistry
+    from ..security.audit import AuditLogger
+    from ..security.credentials import TokenMinter
 
 logger = logging.getLogger(__name__)
 
@@ -48,10 +55,26 @@ class LeafNode(BaseAgent):
     ):
         super().__init__(layer=AgentLayer.LEAF, domain=domain, config=config or {})
         cfg = self.config
+
+        from ..orchestrator.schema_registry import DynamicSchemaRegistry
+
+        self._schema = DynamicSchemaRegistry()
         self._sanitizer = InputSanitizer(cfg.get("sanitizer"))
-        self._classifier = build_classifier(cfg.get("classifier"), cfg.get("agents"))
+        self._classifier = build_classifier(cfg.get("classifier"), cfg.get("agents"), schema=self._schema)
         self._router = DomainRouter(cfg.get("domains"))
         self._gate = EligibilityGate(cfg.get("eligibility"))
+
+    async def start(
+        self,
+        transport: RedisTransport,
+        registry: AgentRegistry | None = None,
+        middleware: MessageMiddleware | None = None,
+        token_minter: TokenMinter | None = None,
+        audit: AuditLogger | None = None,
+    ) -> None:
+        await super().start(transport, registry, middleware, token_minter, audit)
+        self._schema.set_redis(transport.redis)
+        await self._schema.load()
 
     async def handle_message(self, envelope: MessageEnvelope) -> MessageEnvelope | None:
         """Process an incoming user request.

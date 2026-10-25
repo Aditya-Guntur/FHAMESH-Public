@@ -9,6 +9,8 @@ import pytest
 
 pytest.importorskip("langgraph")
 
+from langchain_core.messages import AIMessage
+
 from fhamesh.agents.classifier_graph import (
     ClassificationGraph,
     IntentExtraction,
@@ -29,12 +31,69 @@ class _FakeStructuredLLM:
         return self._extraction
 
 
+class _FakeToolLLM:
+    """Never calls a tool — the reasoning loop goes straight to extract."""
+
+    async def ainvoke(self, messages):
+        return AIMessage(content="no tools needed")
+
+
 class _FakeLLM:
     def __init__(self, structured: _FakeStructuredLLM):
         self._structured = structured
 
+    def bind_tools(self, tools):
+        return _FakeToolLLM()
+
     def with_structured_output(self, schema):
         return self._structured
+
+
+class _ScriptedToolLLM:
+    def __init__(self, script: list[dict | None]):
+        self._script = script
+        self.calls = 0
+
+    async def ainvoke(self, messages):
+        tool_call = self._script[self.calls] if self.calls < len(self._script) else None
+        self.calls += 1
+        if tool_call:
+            return AIMessage(content="", tool_calls=[tool_call])
+        return AIMessage(content="done reasoning")
+
+
+class _ScriptedLLM:
+    def __init__(self, tool_script: list[dict | None], extraction: IntentExtraction):
+        self._tool_llm = _ScriptedToolLLM(tool_script)
+        self._extraction = extraction
+
+    def bind_tools(self, tools):
+        return self._tool_llm
+
+    def with_structured_output(self, schema):
+        return _FakeStructuredLLM(self._extraction)
+
+
+class TestClassificationGraphToolLoop:
+    async def test_real_tool_call_reaches_the_schema_registry(self):
+        tool_script = [{"name": "list_domains", "args": {}, "id": "call_1"}, None]
+        extraction = IntentExtraction(category="query", domain="hr", action="lookup_salary", confidence=0.9)
+        graph = ClassificationGraph(_ScriptedLLM(tool_script, extraction), min_confidence=0.3)
+
+        intent = await graph.run("show me engineering salaries")
+
+        assert intent.domain == "hr"
+
+    async def test_runaway_tool_loop_is_capped(self):
+        always_call = {"name": "list_domains", "args": {}, "id": "call_x"}
+        extraction = IntentExtraction(category="query", domain="hr", action="lookup_salary", confidence=0.9)
+        llm = _ScriptedLLM([always_call] * 20, extraction)
+        graph = ClassificationGraph(llm, min_confidence=0.3)
+
+        intent = await graph.run("salary?")
+
+        assert intent.domain == "hr"
+        assert llm._tool_llm.calls <= 4
 
 
 class TestClassificationGraph:

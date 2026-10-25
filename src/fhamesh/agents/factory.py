@@ -52,6 +52,7 @@ def _require_agents_extra(backend: str, section: str) -> None:
 def build_classifier(
     cfg: dict[str, Any] | None = None,
     agents_cfg: dict[str, Any] | None = None,
+    schema: Any | None = None,
 ) -> BaseClassifier:
     from ..leaf.classifier import IntentClassifier
 
@@ -64,7 +65,7 @@ def build_classifier(
 
     from .classifier_graph import LangGraphClassifier
 
-    return LangGraphClassifier(_merged(cfg, agents_cfg))
+    return LangGraphClassifier(_merged(cfg, agents_cfg), schema=schema)
 
 
 def build_decomposer(

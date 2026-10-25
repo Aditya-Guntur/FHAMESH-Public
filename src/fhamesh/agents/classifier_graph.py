@@ -1,9 +1,13 @@
 """LangGraph intent-classification agent.
 
-Two nodes:
-- extract: an LLM call that reads the sanitized text and produces a
-  structured IntentExtraction (category, domain, action, parameters,
-  confidence)
+Four nodes, the same ReAct shape as the planner agent:
+- reason: a tool-bound LLM that can call list_domains / describe_domain
+  before committing to a domain, instead of guessing from a static
+  system-prompt list — this is how a dynamically registered domain
+  (see DynamicSchemaRegistry) becomes classifiable without a redeploy
+- tools: executes whatever tool call "reason" made, loops back to it
+- extract: once reasoning is done, one structured-output call produces
+  IntentExtraction (category, domain, action, parameters, confidence)
 - calibrate: a deterministic safety net that clamps confidence and
   demotes low-confidence extractions to UNKNOWN, exactly like the
   keyword classifier's min_confidence floor
@@ -17,29 +21,39 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from typing import Any, TypedDict
+from typing import Annotated, Any, TypedDict
 
 from pydantic import BaseModel, Field
 
 from ..core.message import IntentDescriptor
 from ..core.types import IntentCategory
 from ..leaf.classifier import BaseClassifier, IntentClassifier
+from ..orchestrator.schema_registry import DynamicSchemaRegistry
 from .llm import AGENTS_AVAILABLE, build_ollama_llm
+from .tools import build_schema_tools
 
 logger = logging.getLogger(__name__)
 
 if AGENTS_AVAILABLE:
+    from langchain_core.messages import AIMessage, SystemMessage
     from langgraph.graph import END, START, StateGraph
+    from langgraph.graph.message import add_messages
+    from langgraph.prebuilt import ToolNode, tools_condition
+
+_MAX_TOOL_ROUNDS = 3
 
 _VALID_CATEGORIES = {c.value for c in IntentCategory}
 
 _SYSTEM_PROMPT = (
-    "You classify a single user query for a data-access system with three "
-    "domains: hr (employees, salaries, departments), finance (orders, "
-    "revenue, invoices), and product (catalog, inventory, pricing). "
-    "Respond only with the structured fields asked for. Never invent data "
-    "or answer the question itself — you are only classifying it."
+    "You classify a single user query for a data-access system. Use "
+    "list_domains and describe_domain if you're unsure which domain this "
+    "belongs to — don't guess at a domain you haven't confirmed exists. "
+    "Once you know enough, stop calling tools and wait to be asked for the "
+    "final classification. Never invent data or answer the question itself "
+    "— you are only classifying it."
 )
+
+_EXTRACT_PROMPT = "Based on the conversation above, produce the final structured classification."
 
 
 class IntentExtraction(BaseModel):
@@ -62,33 +76,65 @@ class IntentExtraction(BaseModel):
     )
 
 
-class ClassifierState(TypedDict, total=False):
-    text: str
-    extraction: IntentExtraction
-    intent: IntentDescriptor
+if AGENTS_AVAILABLE:
+    class ClassifierState(TypedDict, total=False):
+        text: str
+        messages: Annotated[list[Any], add_messages]
+        tool_rounds: int
+        extraction: IntentExtraction
+        intent: IntentDescriptor
+else:  # pragma: no cover - exercised by the "no [agents] extra" install
+    class ClassifierState(TypedDict, total=False):  # type: ignore[no-redef]
+        text: str
+        tool_rounds: int
+        extraction: Any
+        intent: IntentDescriptor
 
 
 class ClassificationGraph:
-    """Compiled LangGraph pipeline: extract -> calibrate."""
+    """Compiled LangGraph pipeline: reason <-> tools -> extract -> calibrate."""
 
-    def __init__(self, llm: Any, min_confidence: float = 0.3):
-        self._llm = llm.with_structured_output(IntentExtraction)
+    def __init__(self, llm: Any, min_confidence: float = 0.3, schema: Any | None = None):
+        self._schema = schema if schema is not None else DynamicSchemaRegistry()
+        self._tools = build_schema_tools(self._schema)
+        self._tool_llm = llm.bind_tools(self._tools)
+        self._structured_llm = llm.with_structured_output(IntentExtraction)
         self._min_confidence = min_confidence
         self._graph = self._build()
 
     def _build(self) -> Any:
         graph: StateGraph[ClassifierState] = StateGraph(ClassifierState)
+        graph.add_node("reason", self._reason)
+        graph.add_node("tools", ToolNode(self._tools))
         graph.add_node("extract", self._extract)
         graph.add_node("calibrate", self._calibrate)
-        graph.add_edge(START, "extract")
+        graph.add_edge(START, "reason")
+        graph.add_conditional_edges("reason", self._route_after_reason, {"tools": "tools", "extract": "extract"})
+        graph.add_edge("tools", "reason")
         graph.add_edge("extract", "calibrate")
         graph.add_edge("calibrate", END)
         return graph.compile()
 
+    def _route_after_reason(self, state: ClassifierState) -> str:
+        if state.get("tool_rounds", 0) >= _MAX_TOOL_ROUNDS:
+            return "extract"
+        return tools_condition(dict(state), messages_key="messages").replace("__end__", "extract")
+
+    async def _reason(self, state: ClassifierState) -> dict[str, Any]:
+        existing = state.get("messages") or []
+        new_messages: list[Any] = []
+
+        if not existing:
+            new_messages = [SystemMessage(content=_SYSTEM_PROMPT), ("human", state["text"])]
+            existing = new_messages
+
+        response: AIMessage = await self._tool_llm.ainvoke(existing)
+        increment = 1 if getattr(response, "tool_calls", None) else 0
+        return {"messages": [*new_messages, response], "tool_rounds": state.get("tool_rounds", 0) + increment}
+
     async def _extract(self, state: ClassifierState) -> dict[str, Any]:
-        extraction: IntentExtraction = await self._llm.ainvoke(
-            [("system", _SYSTEM_PROMPT), ("human", state["text"])]
-        )
+        messages = list(state.get("messages", [])) + [("human", _EXTRACT_PROMPT)]
+        extraction: IntentExtraction = await self._structured_llm.ainvoke(messages)
         return {"extraction": extraction}
 
     async def _calibrate(self, state: ClassifierState) -> dict[str, Any]:
@@ -132,6 +178,7 @@ class LangGraphClassifier(BaseClassifier):
         self,
         config: dict[str, Any] | None = None,
         fallback: BaseClassifier | None = None,
+        schema: Any | None = None,
     ):
         config = config or {}
         self._min_confidence = config.get("min_confidence", 0.3)
@@ -140,7 +187,7 @@ class LangGraphClassifier(BaseClassifier):
 
         llm = build_ollama_llm(config.get("ollama"))
         if llm is not None:
-            self._graph = ClassificationGraph(llm, min_confidence=self._min_confidence)
+            self._graph = ClassificationGraph(llm, min_confidence=self._min_confidence, schema=schema)
 
     @property
     def active_backend(self) -> str:
