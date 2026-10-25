@@ -6,6 +6,7 @@ by individual DataCore nodes or peer orchestrators.
 
 from __future__ import annotations
 
+import abc
 import logging
 from typing import Any
 
@@ -14,7 +15,21 @@ from ..core.message import IntentDescriptor
 logger = logging.getLogger(__name__)
 
 
-class QueryDecomposer:
+class BaseDecomposer(abc.ABC):
+    """Abstract interface for query decomposers.
+
+    Subclass this to plug in any decomposition backend. decompose() is
+    async so backends that reason over an LLM (see fhamesh.agents) can
+    await a model call without blocking the agent's event loop.
+    """
+
+    @abc.abstractmethod
+    async def decompose(self, intent: IntentDescriptor) -> list[dict[str, Any]]:
+        """Decompose an intent into executable sub-queries."""
+        ...
+
+
+class QueryDecomposer(BaseDecomposer):
     """Decomposes complex intents into executable sub-queries.
 
     A sub-query is a dict with:
@@ -33,7 +48,7 @@ class QueryDecomposer:
         config = config or {}
         self._decomposition_rules: dict[str, Any] = config.get("rules", {})
 
-    def decompose(self, intent: IntentDescriptor) -> list[dict[str, Any]]:
+    async def decompose(self, intent: IntentDescriptor) -> list[dict[str, Any]]:
         """Decompose an intent into sub-queries."""
         if self._is_simple(intent):
             return [self._to_single_query(intent)]

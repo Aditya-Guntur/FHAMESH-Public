@@ -43,7 +43,7 @@ class TestFullPipeline:
 
         # 2. Classify
         classifier = IntentClassifier()
-        intent = classifier.classify(cleaned)
+        intent = await classifier.classify(cleaned)
         intent.sanitized = True
         intent.raw_input_hash = sanitizer.compute_hash("What is the average salary?")
         assert intent.domain == "hr"
@@ -85,7 +85,7 @@ class TestFullPipeline:
 
         # 6. Decompose
         decomposer = QueryDecomposer()
-        sub_queries = decomposer.decompose(intent)
+        sub_queries = await decomposer.decompose(intent)
         assert len(sub_queries) >= 1
 
         # === DATA CORE LAYER ===
@@ -159,7 +159,7 @@ class TestFullPipeline:
         assert safe is True
 
         classifier = IntentClassifier()
-        intent = classifier.classify(cleaned)
+        intent = await classifier.classify(cleaned)
         assert intent.domain == "product"
 
         # Execute

@@ -22,11 +22,13 @@ logger = logging.getLogger(__name__)
 class BaseClassifier(abc.ABC):
     """Abstract interface for intent classifiers.
 
-    Subclass this to plug in any classification backend.
+    Subclass this to plug in any classification backend. classify() is
+    async so backends that reason over an LLM (see fhamesh.agents) can
+    await a model call without blocking the agent's event loop.
     """
 
     @abc.abstractmethod
-    def classify(self, text: str) -> IntentDescriptor:
+    async def classify(self, text: str) -> IntentDescriptor:
         """Classify sanitized user input into an IntentDescriptor."""
         ...
 
@@ -48,7 +50,7 @@ class IntentClassifier(BaseClassifier):
         self._action_patterns: dict[str, list[tuple[str, re.Pattern[str]]]] = {}
         self._load_default_patterns()
 
-    def classify(self, text: str) -> IntentDescriptor:
+    async def classify(self, text: str) -> IntentDescriptor:
         """Classify user input into structured intent.
 
         Returns IntentDescriptor with category, domain, action, and confidence.

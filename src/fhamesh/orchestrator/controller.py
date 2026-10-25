@@ -134,7 +134,7 @@ class OrchestratorNode(BaseAgent):
                 return self._build_error(envelope, f"Policy denied: {verdict.name}")
 
         # Step 4: Decompose
-        sub_queries = self._decomposer.decompose(intent)
+        sub_queries = await self._decomposer.decompose(intent)
 
         for sq in sub_queries:
             sq["user_id"] = user_id

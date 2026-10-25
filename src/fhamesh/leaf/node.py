@@ -76,7 +76,7 @@ class LeafNode(BaseAgent):
             return self._build_rejection(envelope, "Input failed safety checks")
 
         # Step 2: Classify intent
-        intent = self._classifier.classify(sanitized)
+        intent = await self._classifier.classify(sanitized)
         intent.sanitized = True
         intent.raw_input_hash = self._sanitizer.compute_hash(raw_input)
 
