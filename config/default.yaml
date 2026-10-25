@@ -19,6 +19,7 @@ leaf:
     max_length: 2000
   classifier:
     min_confidence: 0.3
+    backend: "auto"   # auto | langgraph | regex
   eligibility:
     min_confidence: 0.3
 
@@ -30,6 +31,20 @@ orchestrator:
     adversarial_threshold: 0.8
   subtree:
     timeout_seconds: 30.0
+  decomposition:
+    backend: "auto"   # auto | langgraph | rules
+  aggregation:
+    backend: "auto"   # auto | langgraph | merge
+
+# Shared connection settings for LangGraph-backed reasoning agents.
+# "auto" backends try this first and fall back to the deterministic
+# implementation if the model is unreachable.
+agents:
+  ollama:
+    model: "llama3.2"
+    base_url: "http://localhost:11434"
+    temperature: 0.0
+    timeout_seconds: 10.0
 
 datacore:
   db_path: "data.db"

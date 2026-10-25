@@ -28,6 +28,7 @@ class SanitizerConfig(BaseModel):
 
 class ClassifierConfig(BaseModel):
     min_confidence: float = 0.3
+    backend: str = "auto"  # auto | langgraph | regex
 
 
 class EligibilityConfig(BaseModel):
@@ -53,10 +54,20 @@ class SubtreeConfig(BaseModel):
     timeout_seconds: float = 30.0
 
 
+class DecompositionConfig(BaseModel):
+    backend: str = "auto"  # auto | langgraph | rules
+
+
+class AggregationConfig(BaseModel):
+    backend: str = "auto"  # auto | langgraph | merge
+
+
 class OrchestratorConfig(BaseModel):
     validation: ValidationConfig = ValidationConfig()
     uncertainty: UncertaintyConfig = UncertaintyConfig()
     subtree: SubtreeConfig = SubtreeConfig()
+    decomposition: DecompositionConfig = DecompositionConfig()
+    aggregation: AggregationConfig = AggregationConfig()
 
 
 class QueryValidationConfig(BaseModel):
@@ -139,6 +150,18 @@ class DomainsConfig(BaseModel):
     domains: dict[str, DomainEntry] = Field(default_factory=dict)
 
 
+class OllamaConfig(BaseModel):
+    model: str = "llama3.2"
+    base_url: str = "http://localhost:11434"
+    temperature: float = 0.0
+    timeout_seconds: float = 10.0
+
+
+class AgentsConfig(BaseModel):
+    """Shared connection settings for LangGraph-backed reasoning agents."""
+    ollama: OllamaConfig = OllamaConfig()
+
+
 class SystemInfo(BaseModel):
     name: str = "fhamesh"
     log_level: str = "INFO"
@@ -156,3 +179,4 @@ class SystemConfig(BaseModel):
     policies: PoliciesConfig = PoliciesConfig()
     privacy: PrivacyConfig = PrivacyConfig()
     domains: DomainsConfig = DomainsConfig()
+    agents: AgentsConfig = AgentsConfig()
