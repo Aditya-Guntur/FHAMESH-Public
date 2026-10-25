@@ -45,10 +45,10 @@ class QueryDecomposer(BaseDecomposer):
     For production, subclass and add ML-based decomposition.
     """
 
-    def __init__(self, config: dict[str, Any] | None = None):
+    def __init__(self, config: dict[str, Any] | None = None, schema: DomainSchema | Any | None = None):
         config = config or {}
         self._decomposition_rules: dict[str, Any] = config.get("rules", {})
-        self._schema = DomainSchema()
+        self._schema = schema if schema is not None else DomainSchema()
 
     async def decompose(self, intent: IntentDescriptor) -> list[dict[str, Any]]:
         """Decompose an intent into sub-queries."""

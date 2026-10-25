@@ -65,7 +65,7 @@ class PlannerState(TypedDict, total=False):
 class PlanningGraph:
     """Compiled LangGraph pipeline: plan -> validate_plan."""
 
-    def __init__(self, llm: Any, schema: DomainSchema | None = None):
+    def __init__(self, llm: Any, schema: DomainSchema | Any | None = None):
         self._llm = llm.with_structured_output(DecompositionPlan)
         self._schema = schema or DomainSchema()
         self._graph = self._build()
@@ -143,14 +143,15 @@ class LangGraphDecomposer(BaseDecomposer):
         self,
         config: dict[str, Any] | None = None,
         fallback: BaseDecomposer | None = None,
+        schema: DomainSchema | Any | None = None,
     ):
         config = config or {}
-        self._fallback = fallback or QueryDecomposer(config)
+        self._fallback = fallback or QueryDecomposer(config, schema=schema)
         self._graph: PlanningGraph | None = None
 
         llm = build_ollama_llm(config.get("ollama"))
         if llm is not None:
-            self._graph = PlanningGraph(llm)
+            self._graph = PlanningGraph(llm, schema=schema)
 
     @property
     def active_backend(self) -> str:

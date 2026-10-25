@@ -8,7 +8,7 @@ path, enforce policy, spawn subtrees, and aggregate results.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..agents.factory import build_aggregator, build_decomposer
 from ..core.agent import BaseAgent
@@ -18,10 +18,17 @@ from ..security.credentials import ScopedToken
 from ..security.policy import PolicyAttestation, PolicyEngine, RateLimiter
 from ..security.rbac import RBACEnforcer
 from .mesh import PeerMesh
-from .schema import DomainSchema
+from .schema_registry import DynamicSchemaRegistry
 from .subtree import SubtreeManager
 from .uncertainty import UncertaintyEstimator
 from .validator import ExecutionPathValidator
+
+if TYPE_CHECKING:
+    from ..bus.middleware import MessageMiddleware
+    from ..bus.transport import RedisTransport
+    from ..core.registry import AgentRegistry
+    from ..security.audit import AuditLogger
+    from ..security.credentials import TokenMinter
 
 logger = logging.getLogger(__name__)
 
@@ -45,13 +52,25 @@ class OrchestratorNode(BaseAgent):
         cfg = self.config
         self._validator = ExecutionPathValidator(cfg.get("validation"))
         self._uncertainty = UncertaintyEstimator(cfg.get("uncertainty"))
-        self._decomposer = build_decomposer(cfg.get("decomposition"), cfg.get("agents"))
-        self._schema = DomainSchema()
+        self._schema = DynamicSchemaRegistry()
+        self._decomposer = build_decomposer(cfg.get("decomposition"), cfg.get("agents"), schema=self._schema)
         self._subtree_mgr = SubtreeManager(self)
         self._aggregator = build_aggregator(cfg.get("aggregation"), cfg.get("agents"))
         self._peer_mesh = PeerMesh(self)
         self._policy_engine: PolicyEngine | None = None
         self._rbac: RBACEnforcer | None = None
+
+    async def start(
+        self,
+        transport: RedisTransport,
+        registry: AgentRegistry | None = None,
+        middleware: MessageMiddleware | None = None,
+        token_minter: TokenMinter | None = None,
+        audit: AuditLogger | None = None,
+    ) -> None:
+        await super().start(transport, registry, middleware, token_minter, audit)
+        self._schema.set_redis(transport.redis)
+        await self._schema.load()
 
     def set_policy_engine(self, engine: PolicyEngine) -> None:
         """Inject policy engine after construction."""

@@ -70,6 +70,7 @@ def build_classifier(
 def build_decomposer(
     cfg: dict[str, Any] | None = None,
     agents_cfg: dict[str, Any] | None = None,
+    schema: Any | None = None,
 ) -> BaseDecomposer:
     from ..orchestrator.decomposer import QueryDecomposer
 
@@ -78,11 +79,11 @@ def build_decomposer(
     _require_agents_extra(backend, "decomposition")
 
     if backend == "rules" or not AGENTS_AVAILABLE:
-        return QueryDecomposer(cfg)
+        return QueryDecomposer(cfg, schema=schema)
 
     from .decomposer_graph import LangGraphDecomposer
 
-    return LangGraphDecomposer(_merged(cfg, agents_cfg))
+    return LangGraphDecomposer(_merged(cfg, agents_cfg), schema=schema)
 
 
 def build_aggregator(
