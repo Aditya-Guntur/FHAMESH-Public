@@ -91,7 +91,7 @@ async def main():
 
     print("\n[2] Query tree for correlation", correlation_id)
     print("-" * 40)
-    tree = await tree_manager.show_tree_for_correlation(correlation_id)
+    tree = await tree_manager.show_tree_ascii(correlation_id)
     print(tree or "(empty)")
 
     print("\n[3] Branch analysis (detects cutoffs)")
