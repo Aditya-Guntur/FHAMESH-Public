@@ -83,7 +83,7 @@ fhamesh health
 pytest
 ```
 
-Tests use `fakeredis` — no real Redis server required, and the LangGraph agent tests mock the LLM boundary — no Ollama server required either. 147 tests covering security, privacy, sanitization, storage, classification, query planning, result synthesis, and the full pipeline.
+Tests use `fakeredis` — no real Redis server required, and the LangGraph agent tests mock the LLM boundary — no Ollama server required either. 204 tests covering security, privacy, sanitization, storage, classification, query planning, result synthesis, cross-domain coordination, session memory, streaming, and the full pipeline.
 
 ## Project Structure
 
@@ -92,12 +92,15 @@ src/fhamesh/
   core/          BaseAgent, MessageEnvelope, types, errors, registry
   security/      ScopedToken, TokenMinter, CredentialVerifier, RBAC, PolicyEngine
   bus/           RedisTransport, ChannelRouter, MessageMiddleware
-  leaf/          LeafNode, IntentClassifier (regex), DomainRouter, EligibilityGate
+  leaf/          LeafNode, IntentClassifier (regex), DomainRouter, EligibilityGate,
+                 SessionMemory
   orchestrator/  OrchestratorNode, QueryDecomposer (rules), ResultAggregator (merge),
-                 DomainSchema, SubtreeManager, PeerMesh, UncertaintyEstimator
-  agents/        LangGraph reasoning agents — classification, query planning, result
-                 synthesis — plus the backend factory that picks LangGraph vs.
-                 deterministic per config, with automatic per-call fallback
+                 DomainSchema, DynamicSchemaRegistry, SubtreeManager, PeerMesh,
+                 UncertaintyEstimator
+  agents/        LangGraph reasoning agents — classification, query planning,
+                 result synthesis, cross-domain coordination — plus their tools
+                 and the backend factory that picks LangGraph vs. deterministic
+                 per config, with automatic per-call fallback
   datacore/      DataCoreNode, DifferentialPrivacyEngine, PIISanitizer, SQLiteBackend
   config/        ConfigLoader, Pydantic schemas
   runner.py      CLI entry point
@@ -108,26 +111,44 @@ tests/           unit/, integration/, e2e/
 
 ## Reasoning Agents
 
-Three places in the mesh make a judgment call instead of following a fixed rule, and each one is a real [LangGraph](https://github.com/langchain-ai/langgraph) agent, not a single prompt pretending to be one:
+Three places in the mesh make a judgment call instead of following a fixed rule, and each one is a real [LangGraph](https://github.com/langchain-ai/langgraph) agent — stateful, tool-using, with deterministic safety nets — not a single prompt pretending to be one:
 
 | Agent | Where | Graph | Grounded in |
 |-------|-------|-------|-------------|
-| Classification | Leaf | `extract` (LLM) → `calibrate` (deterministic confidence floor) | — |
-| Query planning | Orchestrator | `plan` (LLM) → `validate_plan` (deterministic schema check) | `DomainSchema` — known tables/fields, so the model can't invent one |
-| Result synthesis | Orchestrator | `merge` (deterministic, unchanged) → `synthesize` (LLM) | Already privacy-protected data only — the model never sees raw rows |
+| Classification | Leaf | `recall` → `reason` ⇄ `tools` → `extract` → `calibrate` → `record` | `DynamicSchemaRegistry` (via tools) + `SessionMemory` |
+| Query planning | Orchestrator | `plan` ⇄ `tools` → `finalize` → `validate_plan` | `DynamicSchemaRegistry` — known/registered tables & fields, so the model can't invent one |
+| Result synthesis | Orchestrator | `merge` (deterministic, unchanged) → `reason` ⇄ `tools` → `synthesize` → `verify` | Already privacy-protected data only — the model never sees raw rows |
 
-Every agent is wrapped behind the same abstract interface its deterministic predecessor used (`BaseClassifier`, `BaseDecomposer`, `BaseAggregator`), and every one falls back to the deterministic implementation for that single call if Ollama is unreachable or returns something unusable — logged as a warning, not a failure. Pick the backend per layer in config:
+Every agent is wrapped behind the same abstract interface its deterministic predecessor used (`BaseClassifier`, `BaseDecomposer`, `BaseAggregator`), and every one falls back to the deterministic implementation for that single call if Ollama is unreachable or returns something unusable — logged as a warning, not a failure.
+
+**Tool use.** Each agent can call real tools mid-reasoning instead of having everything dumped into the prompt up front — `list_domains` / `describe_domain` (classifier, planner) and `compute_percentage_change` / `format_currency` (synthesizer), capped at a few rounds so a model that always wants to call something still terminates.
+
+**Dynamic schema.** `DynamicSchemaRegistry` wraps the static `DomainSchema` with domains registered at runtime (`register_domain(domain, table, actions)`), shared mesh-wide through Redis — add a domain without a redeploy, and the classifier, planner, and policy enforcement all see it immediately.
+
+**Session memory.** `SessionMemory` stores structured turns (domain/action/parameters — never raw text) per user, Redis-backed, TTL'd. The classifier's `recall`/`record` nodes mean "and in sales?" gets classified using the previous turn's domain as context.
+
+**Cross-domain consensus.** When a query genuinely spans more than one domain, `CoordinatorGraph` asks each target domain's own orchestrator (over `PeerMesh`, a real peer-to-peer request — not a shared database) what it actually has, before an LLM negotiates the final plan. No orchestrator ever answers for another domain's data.
+
+**Self-verification.** The synthesizer's `verify` node is an independent second LLM call that fact-checks the drafted summary against the actual data and corrects or drops it if something doesn't hold up — a hallucinated or misrounded number never reaches the user silently.
+
+**Streaming.** Strictly opt-in (`streaming.enabled`, default off, byte-for-byte unchanged behavior when off). A caller using `RedisTransport.request_stream()` gets live `STREAM_CHUNK` text as the synthesizer generates it, ahead of the authoritative, verified response — a fast preview, not a replacement for verification.
+
+Pick the backend per layer, and opt into streaming, in config:
 
 ```yaml
 leaf:
   classifier:
     backend: "auto"   # auto | langgraph | regex
+  streaming:
+    enabled: false
 
 orchestrator:
   decomposition:
     backend: "auto"   # auto | langgraph | rules
   aggregation:
     backend: "auto"   # auto | langgraph | merge
+  streaming:
+    enabled: false
 
 agents:
   ollama:
