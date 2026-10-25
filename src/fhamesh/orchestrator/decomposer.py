@@ -11,6 +11,7 @@ import logging
 from typing import Any
 
 from ..core.message import IntentDescriptor
+from .schema import DomainSchema
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,7 @@ class QueryDecomposer(BaseDecomposer):
     def __init__(self, config: dict[str, Any] | None = None):
         config = config or {}
         self._decomposition_rules: dict[str, Any] = config.get("rules", {})
+        self._schema = DomainSchema()
 
     async def decompose(self, intent: IntentDescriptor) -> list[dict[str, Any]]:
         """Decompose an intent into sub-queries."""
@@ -143,58 +145,12 @@ class QueryDecomposer(BaseDecomposer):
 
     def _resolve_table(self, intent: IntentDescriptor) -> str:
         """Map domain + action to a database table."""
-        domain_tables = {
-            "hr": "employees",
-            "finance": "orders",
-            "product": "products",
-        }
-        # Check explicit parameter first
-        if "table" in intent.parameters:
-            return intent.parameters["table"]
-        return domain_tables.get(intent.domain, "employees")
+        return self._schema.resolve_table(intent.domain, intent.parameters.get("table"))
 
     def _resolve_fields(self, intent: IntentDescriptor) -> list[str]:
         """Determine which fields to request based on intent."""
-        if "fields" in intent.parameters:
-            return intent.parameters["fields"]
-
-        # Default fields by domain and action
-        field_map = {
-            "hr": {
-                "lookup_salary": ["name", "department", "salary"],
-                "lookup_employee": ["name", "department", "title", "email"],
-                "list_department": ["name", "department", "title"],
-                "aggregate": ["department", "salary"],
-            },
-            "finance": {
-                "lookup_order": ["order_id", "customer_name", "amount", "date"],
-                "aggregate_revenue": ["amount", "date"],
-                "list_transactions": ["order_id", "customer_name", "amount", "date"],
-                "aggregate": ["amount", "date"],
-            },
-            "product": {
-                "lookup_product": ["product_id", "name", "category", "price"],
-                "list_catalog": ["product_id", "name", "category", "price"],
-                "aggregate": ["category", "price"],
-            },
-        }
-
-        domain_fields = field_map.get(intent.domain, {})
-        fields = domain_fields.get(intent.action, domain_fields.get("aggregate", ["*"]))
-        return fields
+        return self._schema.resolve_fields(intent.domain, intent.action, intent.parameters.get("fields"))
 
     def _resolve_filters(self, intent: IntentDescriptor) -> dict[str, Any]:
         """Extract filter conditions from intent parameters."""
-        filters = {}
-        param_to_filter = {
-            "department": "department",
-            "dept": "department",
-            "customer": "customer_name",
-            "category": "category",
-            "date_from": "date_from",
-            "date_to": "date_to",
-        }
-        for param_key, filter_key in param_to_filter.items():
-            if param_key in intent.parameters:
-                filters[filter_key] = intent.parameters[param_key]
-        return filters
+        return self._schema.resolve_filters(intent.parameters)
