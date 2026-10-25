@@ -215,4 +215,5 @@ class LeafNode(BaseAgent):
             "layer": "leaf",
             "domain": self.domain,
             "status": "ok",
+            "classifier_backend": getattr(self._classifier, "active_backend", type(self._classifier).__name__),
         }

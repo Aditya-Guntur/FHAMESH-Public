@@ -58,6 +58,26 @@ class TestBuildAggregator:
         assert isinstance(agg, ResultAggregator)
 
 
+class TestActiveBackendVisibility:
+    def test_classifier_reports_langgraph_when_graph_ready(self):
+        clf = factory.build_classifier({"backend": "auto"})
+        assert clf.active_backend == "langgraph"
+
+    def test_classifier_reports_fallback_class_when_unavailable(self, monkeypatch):
+        monkeypatch.setattr(factory, "AGENTS_AVAILABLE", False)
+        clf = factory.build_classifier({"backend": "auto"})
+        assert not hasattr(clf, "active_backend")  # plain IntentClassifier has no such property
+        assert type(clf).__name__ == "IntentClassifier"
+
+    def test_decomposer_reports_langgraph_when_graph_ready(self):
+        dec = factory.build_decomposer({"backend": "auto"})
+        assert dec.active_backend == "langgraph"
+
+    def test_aggregator_reports_langgraph_when_graph_ready(self):
+        agg = factory.build_aggregator({"backend": "auto"})
+        assert agg.active_backend == "langgraph"
+
+
 class TestAgentsConfigPropagation:
     def test_ollama_settings_reach_the_classifier(self):
         clf = factory.build_classifier(

@@ -314,4 +314,6 @@ class OrchestratorNode(BaseAgent):
             "domain": self.domain,
             "active_subtrees": self._subtree_mgr.active_count(),
             "status": "ok",
+            "decomposer_backend": getattr(self._decomposer, "active_backend", type(self._decomposer).__name__),
+            "aggregator_backend": getattr(self._aggregator, "active_backend", type(self._aggregator).__name__),
         }

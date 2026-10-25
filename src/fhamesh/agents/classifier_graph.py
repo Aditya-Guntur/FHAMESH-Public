@@ -142,6 +142,11 @@ class LangGraphClassifier(BaseClassifier):
         if llm is not None:
             self._graph = ClassificationGraph(llm, min_confidence=self._min_confidence)
 
+    @property
+    def active_backend(self) -> str:
+        """Returns 'langgraph' if the agent graph is ready, else the fallback's class name."""
+        return "langgraph" if self._graph is not None else type(self._fallback).__name__
+
     async def classify(self, text: str) -> IntentDescriptor:
         if not text.strip():
             return IntentDescriptor(

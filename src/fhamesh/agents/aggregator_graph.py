@@ -113,6 +113,11 @@ class LangGraphAggregator(BaseAggregator):
         if llm is not None:
             self._graph = SynthesisGraph(llm)
 
+    @property
+    def active_backend(self) -> str:
+        """Returns 'langgraph' if the agent graph is ready, else the fallback's class name."""
+        return "langgraph" if self._graph is not None else type(self._fallback).__name__
+
     async def aggregate(self, results: list[QueryResult]) -> QueryResult:
         if self._graph is not None:
             try:
