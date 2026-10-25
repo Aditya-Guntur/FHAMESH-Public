@@ -22,6 +22,10 @@ leaf:
     backend: "auto"   # auto | langgraph | regex
   eligibility:
     min_confidence: 0.3
+  # Opt-in. Must also be true on orchestrator.streaming to have any
+  # effect; a plain request() caller is unaffected either way.
+  streaming:
+    enabled: false
 
 orchestrator:
   validation:
@@ -35,6 +39,8 @@ orchestrator:
     backend: "auto"   # auto | langgraph | rules
   aggregation:
     backend: "auto"   # auto | langgraph | merge
+  streaming:
+    enabled: false
 
 # Shared connection settings for LangGraph-backed reasoning agents.
 # "auto" backends try this first and fall back to the deterministic

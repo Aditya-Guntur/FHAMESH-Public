@@ -68,6 +68,7 @@ class LeafNode(BaseAgent):
         )
         self._router = DomainRouter(cfg.get("domains"))
         self._gate = EligibilityGate(cfg.get("eligibility"))
+        self._streaming_enabled = cfg.get("streaming", {}).get("enabled", False)
 
     async def start(
         self,
@@ -149,22 +150,58 @@ class LeafNode(BaseAgent):
 
         # Use request/reply to synchronously wait for the orchestrator's response
         if self._transport:
+            caller_reply_channel = envelope.payload.get("_reply_channel", "")
+            if self._streaming_enabled and caller_reply_channel:
+                return await self._forward_streaming(envelope, forward_envelope, caller_reply_channel)
+
             response = await self._transport.request(forward_envelope, timeout=15.0)
             if response:
                 # Relay the orchestrator's response back to the original caller
-                return MessageEnvelope(
-                    correlation_id=envelope.correlation_id or envelope.message_id,
-                    message_type=response.message_type,
-                    source_agent_id=self.agent_id,
-                    target_agent_id=envelope.source_agent_id,
-                    payload=response.payload,
-                    parent_message_id=envelope.message_id,
-                    hop_count=response.hop_count + 1,
-                    max_hops=envelope.max_hops,
-                )
+                return self._relay(envelope, response)
             else:
                 return self._build_rejection(envelope, "Orchestrator timeout")
         return self._build_rejection(envelope, "No transport available")
+
+    def _relay(self, original: MessageEnvelope, response: MessageEnvelope) -> MessageEnvelope:
+        """Wrap an orchestrator response as if it came from this leaf node."""
+        return MessageEnvelope(
+            correlation_id=original.correlation_id or original.message_id,
+            message_type=response.message_type,
+            source_agent_id=self.agent_id,
+            target_agent_id=original.source_agent_id,
+            payload=response.payload,
+            parent_message_id=original.message_id,
+            hop_count=response.hop_count + 1,
+            max_hops=original.max_hops,
+        )
+
+    async def _forward_streaming(
+        self,
+        original: MessageEnvelope,
+        forward_envelope: MessageEnvelope,
+        caller_reply_channel: str,
+    ) -> MessageEnvelope | None:
+        """Relay the orchestrator's STREAM_CHUNK envelopes live, then the final response.
+
+        Only reached when streaming is enabled AND the original caller
+        itself used transport.request_stream() (it's the only way
+        caller_reply_channel gets set) — a plain request() caller is
+        never routed here.
+        """
+        assert self._transport is not None  # callers only reach here after checking
+        final: MessageEnvelope | None = None
+        async for response in self._transport.request_stream(forward_envelope, timeout=15.0):
+            if response.message_type == MessageType.STREAM_CHUNK.value:
+                relayed = self._relay(original, response)
+                d = relayed.to_dict()
+                d["payload"]["_reply_channel"] = caller_reply_channel
+                await self.send(MessageEnvelope.from_dict(d))
+            else:
+                final = response
+
+        if final is None:
+            return self._build_rejection(original, "Orchestrator timeout")
+        return self._relay(original, final)
 
     async def _build_forward(
         self,

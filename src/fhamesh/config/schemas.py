@@ -35,10 +35,19 @@ class EligibilityConfig(BaseModel):
     min_confidence: float = 0.3
 
 
+class StreamingConfig(BaseModel):
+    """Opt-in: when False (default), nothing changes — plain request()
+    callers keep working exactly as before. When True on BOTH leaf and
+    orchestrator, a caller using request_stream() gets live synthesis
+    preview chunks ahead of the final response."""
+    enabled: bool = False
+
+
 class LeafConfig(BaseModel):
     sanitizer: SanitizerConfig = SanitizerConfig()
     classifier: ClassifierConfig = ClassifierConfig()
     eligibility: EligibilityConfig = EligibilityConfig()
+    streaming: StreamingConfig = StreamingConfig()
 
 
 class ValidationConfig(BaseModel):
@@ -68,6 +77,7 @@ class OrchestratorConfig(BaseModel):
     subtree: SubtreeConfig = SubtreeConfig()
     decomposition: DecompositionConfig = DecompositionConfig()
     aggregation: AggregationConfig = AggregationConfig()
+    streaming: StreamingConfig = StreamingConfig()
 
 
 class QueryValidationConfig(BaseModel):

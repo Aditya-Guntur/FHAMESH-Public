@@ -59,6 +59,7 @@ class OrchestratorNode(BaseAgent):
         self._peer_mesh = PeerMesh(self)
         self._policy_engine: PolicyEngine | None = None
         self._rbac: RBACEnforcer | None = None
+        self._streaming_enabled = cfg.get("streaming", {}).get("enabled", False)
 
         self._coordinator: Any = None
         from ..agents.llm import build_ollama_llm
@@ -189,6 +190,7 @@ class OrchestratorNode(BaseAgent):
                 sub_queries[0], envelope, attestation, user_id, role,
             )
             if result is not None:
+                await self._stream_preview(envelope, [result])
                 # Route through the aggregator even for a single result —
                 # this is the only place a LangGraph aggregator's synthesis
                 # (and now streaming) actually runs; previously only the
@@ -321,6 +323,41 @@ class OrchestratorNode(BaseAgent):
         if parent_envelope:
             return self._build_response(parent_envelope, aggregated)
         return None
+
+    async def _stream_preview(self, envelope: MessageEnvelope, results: list[QueryResult]) -> None:
+        """Send live STREAM_CHUNK envelopes ahead of the final response.
+
+        Strictly opt-in: a no-op unless streaming.enabled is true in
+        config AND the caller supplied a _reply_channel (which only
+        happens for a request made through transport.request_stream() —
+        a plain request() caller never sets this, so it can never
+        receive a stream chunk when it's only listening for one
+        message). The authoritative summary still comes from
+        aggregate() in the caller, same as when streaming is off.
+        """
+        if not self._streaming_enabled:
+            return
+        reply_channel = envelope.payload.get("_reply_channel", "")
+        if not reply_channel:
+            return
+        if not getattr(self._aggregator, "can_stream", False):
+            return
+        astream_summary = getattr(self._aggregator, "astream_summary", None)
+        if astream_summary is None:
+            return
+
+        async for chunk in astream_summary(results):
+            chunk_envelope = MessageEnvelope(
+                correlation_id=envelope.correlation_id,
+                message_type=MessageType.STREAM_CHUNK.value,
+                source_agent_id=self.agent_id,
+                target_agent_id=envelope.source_agent_id,
+                payload={"chunk": chunk, "_reply_channel": reply_channel},
+                parent_message_id=envelope.message_id,
+                hop_count=envelope.hop_count + 1,
+                max_hops=envelope.max_hops,
+            )
+            await self.send(chunk_envelope)
 
     async def _peer_query(
         self, domain: str, query: dict[str, Any], envelope: MessageEnvelope,
