@@ -11,6 +11,7 @@ from typing import Any
 import redis.asyncio as aioredis
 
 from ..core.message import MessageEnvelope
+from ..core.types import MessageType
 from .channels import ChannelRouter
 
 logger = logging.getLogger(__name__)
@@ -138,3 +139,47 @@ class RedisTransport:
             await reply_pubsub.close()
 
         return None
+
+    async def request_stream(
+        self,
+        envelope: MessageEnvelope,
+        timeout: float = 30.0,
+    ) -> AsyncIterator[MessageEnvelope]:
+        """Send a message and yield every correlated response.
+
+        Same reply-channel mechanism as request(), but doesn't stop at
+        the first match: a responder may publish any number of
+        STREAM_CHUNK envelopes before its one terminal envelope (any
+        other message type). This yields all of them, in order, then
+        stops after the terminal one. timeout applies to the whole
+        stream, not each individual chunk.
+        """
+        if self._redis is None:
+            raise RuntimeError("Transport not connected")
+
+        reply_channel = f"fhamesh:reply:{uuid.uuid4().hex[:12]}"
+        reply_pubsub = self._redis.pubsub()
+        await reply_pubsub.subscribe(reply_channel)
+        await asyncio.sleep(0.05)
+
+        data = envelope.to_dict()
+        data["payload"] = {**data["payload"], "_reply_channel": reply_channel}
+        request_envelope = MessageEnvelope.from_dict(data)
+        await self.publish(request_envelope)
+
+        try:
+            async with asyncio.timeout(timeout):
+                async for message in reply_pubsub.listen():
+                    if message["type"] != "message":
+                        continue
+                    response = MessageEnvelope.from_bytes(message["data"])
+                    if response.correlation_id != envelope.correlation_id:
+                        continue
+                    yield response
+                    if response.message_type != MessageType.STREAM_CHUNK.value:
+                        return
+        except TimeoutError:
+            logger.warning("Streaming request timed out for %s", envelope.message_id)
+        finally:
+            await reply_pubsub.unsubscribe(reply_channel)
+            await reply_pubsub.close()

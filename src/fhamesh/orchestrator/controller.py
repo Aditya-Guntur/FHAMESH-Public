@@ -189,7 +189,13 @@ class OrchestratorNode(BaseAgent):
                 sub_queries[0], envelope, attestation, user_id, role,
             )
             if result is not None:
-                return self._build_response(envelope, result)
+                # Route through the aggregator even for a single result —
+                # this is the only place a LangGraph aggregator's synthesis
+                # (and now streaming) actually runs; previously only the
+                # subtree fan-in path called aggregate(), so a plain
+                # single-table query never got a summary.
+                final = await self._aggregator.aggregate([result])
+                return self._build_response(envelope, final)
             return None
         else:
             timeout = self.config.get("subtree", {}).get("timeout_seconds", 30.0)

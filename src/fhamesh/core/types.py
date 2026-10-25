@@ -17,6 +17,7 @@ class MessageType(Enum):
     """All message types in the mesh protocol."""
     INTENT_REQUEST = "intent_request"
     INTENT_RESPONSE = "intent_response"
+    STREAM_CHUNK = "stream_chunk"
     DATA_QUERY = "data_query"
     DATA_RESPONSE = "data_response"
     SUBTREE_SPAWN = "subtree_spawn"
