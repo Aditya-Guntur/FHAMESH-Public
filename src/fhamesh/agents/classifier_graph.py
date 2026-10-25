@@ -77,7 +77,7 @@ class ClassificationGraph:
         self._graph = self._build()
 
     def _build(self) -> Any:
-        graph: StateGraph = StateGraph(ClassifierState)
+        graph: StateGraph[ClassifierState] = StateGraph(ClassifierState)
         graph.add_node("extract", self._extract)
         graph.add_node("calibrate", self._calibrate)
         graph.add_edge(START, "extract")
@@ -115,7 +115,7 @@ class ClassificationGraph:
         return {"intent": intent}
 
     async def run(self, text: str) -> IntentDescriptor:
-        result = await self._graph.ainvoke({"text": text})
+        result: ClassifierState = await self._graph.ainvoke({"text": text})
         return result["intent"]
 
 
@@ -153,7 +153,7 @@ class LangGraphClassifier(BaseClassifier):
         if self._graph is not None:
             try:
                 return await self._graph.run(text)
-            except Exception:  # noqa: BLE001 - any model/transport failure falls back
+            except Exception:
                 logger.warning("LangGraph classifier unavailable, falling back to regex", exc_info=True)
 
         return await self._fallback.classify(text)

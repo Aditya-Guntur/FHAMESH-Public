@@ -38,7 +38,7 @@ class _FakeLLM:
 
 
 def _intent(**overrides):
-    base = dict(category="query", domain="hr", action="lookup_salary", confidence=0.9, parameters={})
+    base = {"category": "query", "domain": "hr", "action": "lookup_salary", "confidence": 0.9, "parameters": {}}
     base.update(overrides)
     return IntentDescriptor(**base)
 

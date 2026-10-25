@@ -57,7 +57,7 @@ class SynthesisGraph:
         self._graph = self._build()
 
     def _build(self) -> Any:
-        graph: StateGraph = StateGraph(AggregatorState)
+        graph: StateGraph[AggregatorState] = StateGraph(AggregatorState)
         graph.add_node("merge", self._merge)
         graph.add_node("synthesize", self._synthesize)
         graph.add_edge(START, "merge")
@@ -117,7 +117,7 @@ class LangGraphAggregator(BaseAggregator):
         if self._graph is not None:
             try:
                 return await self._graph.run(results)
-            except Exception:  # noqa: BLE001 - any model/transport failure falls back
+            except Exception:
                 logger.warning("LangGraph synthesis unavailable, falling back to merge-only", exc_info=True)
 
         return await self._fallback.aggregate(results)

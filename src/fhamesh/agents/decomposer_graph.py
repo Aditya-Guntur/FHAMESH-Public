@@ -71,7 +71,7 @@ class PlanningGraph:
         self._graph = self._build()
 
     def _build(self) -> Any:
-        graph: StateGraph = StateGraph(PlannerState)
+        graph: StateGraph[PlannerState] = StateGraph(PlannerState)
         graph.add_node("plan", self._plan)
         graph.add_node("validate_plan", self._validate_plan)
         graph.add_edge(START, "plan")
@@ -127,7 +127,7 @@ class PlanningGraph:
         }
 
     async def run(self, intent: IntentDescriptor) -> list[dict[str, Any]]:
-        result = await self._graph.ainvoke({"intent": intent})
+        result: PlannerState = await self._graph.ainvoke({"intent": intent})
         return result["sub_queries"]
 
 
@@ -158,7 +158,7 @@ class LangGraphDecomposer(BaseDecomposer):
                 sub_queries = await self._graph.run(intent)
                 if sub_queries:
                     return sub_queries
-            except Exception:  # noqa: BLE001 - any model/transport failure falls back
+            except Exception:
                 logger.warning("LangGraph planner unavailable, falling back to rules", exc_info=True)
 
         return await self._fallback.decompose(intent)
